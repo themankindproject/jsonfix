@@ -821,7 +821,7 @@ fn quote_family(c: char) -> QuoteFamily {
     }
 }
 
-impl<'a> Lexer<'a> {
+impl Lexer<'_> {
     /// Whether every repair pass is disabled.
     fn strict(&self) -> bool {
         self.opts.repairs == Repairs::NONE

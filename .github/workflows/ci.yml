@@ -84,11 +84,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz build
-      - run: cargo fuzz run repair -- -runs=50000 -max_len=4096
-      - run: cargo fuzz run parse -- -runs=50000 -max_len=4096
-      - run: cargo fuzz run extract -- -runs=50000 -max_len=4096
-      - run: cargo fuzz run stream -- -runs=50000 -max_len=4096
-      - run: cargo fuzz run options -- -runs=50000 -max_len=4096
-      - run: cargo fuzz run bytes -- -runs=50000 -max_len=4096
-      - run: cargo fuzz run from_value -- -runs=50000 -max_len=4096
+      # Pin the target triple: cargo-fuzz's default varies between its
+      # release binaries (gnu locally, musl via install-action), and the musl
+      # build wants a musl std and a non-static CRT to link ASan. The gnu
+      # triple is the host and always has its std installed.
+      - run: cargo fuzz build --target x86_64-unknown-linux-gnu
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu repair -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu parse -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu extract -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu stream -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu options -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu bytes -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu from_value -- -runs=50000 -max_len=4096

@@ -641,7 +641,7 @@ impl<'a, 'b> Parser<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Parser<'a, 'b> {
+impl Parser<'_, '_> {
     /// Parses one value.
     ///
     /// Returns `None` when there is no value at the cursor, and also when the
@@ -886,7 +886,7 @@ enum KeyStep<'a> {
     Stop,
 }
 
-impl<'a, 'b> Parser<'a, 'b> {
+impl<'a> Parser<'a, '_> {
     fn parse_key(&mut self) -> Result<KeyStep<'a>, Error> {
         let Some(tag) = self.peek_tag(true)? else {
             return Ok(KeyStep::Stop);
