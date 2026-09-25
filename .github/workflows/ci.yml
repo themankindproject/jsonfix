@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Benchmarks live in a workspace member so `cargo test` skips criterion.
+      - run: cargo clippy -p jsonfix-benchmarks --all-targets -- -D warnings
+      - run: cargo test --all-features
+      # Default features: catches accidental use of feature-gated API in
+      # tests/examples that only compiles under --all-features.
+      - run: cargo test
+      # no_std compatibility: the crate itself must build with nothing but
+      # `alloc` (the optional serde deps are declared alloc-only as well).
+      - run: cargo check --no-default-features
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Minimum Supported Rust Version: the whole check/test surface must keep
+  # compiling on 1.85.0 (edition 2024).
+  msrv:
+    name: MSRV (1.85.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features
+      - run: cargo test --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Doctests get their own job so a doc example regression is reported
+  # independently of the main test run.
+  doctest:
+    name: doctest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --doc --all-features
+
+  # Packaging: `cargo publish --dry-run` catches broken metadata, a missing
+  # README/license file, or tests accidentally left in the shipped package
+  # (the manifest excludes tests/benches/examples/fuzz).
+  package:
+    name: package (publish dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run --allow-dirty
+
+  # cargo-fuzz: nightly + libFuzzer. Compiles every target and runs a short
+  # smoke pass so a harness that no longer builds (or a seed that crashes)
+  # fails the PR. Longer runs belong in a scheduled workflow, not here.
+  fuzz:
+    name: fuzz (build + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fuzz build
+      - run: cargo fuzz run repair -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run parse -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run extract -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run stream -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run options -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run bytes -- -runs=50000 -max_len=4096
+      - run: cargo fuzz run from_value -- -runs=50000 -max_len=4096

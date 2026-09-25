@@ -1,0 +1,58 @@
+[package]
+name = "jsonfix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Repair, extract, and partially parse malformed JSON from LLMs and other unreliable sources. no_std, zero dependencies, lossless numbers."
+repository = "https://github.com/themankindproject/jsonfix"
+homepage = "https://github.com/themankindproject/jsonfix"
+authors = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
+keywords = ["json", "repair", "llm", "streaming", "no-std"]
+categories = ["parsing", "no-std", "development-tools"]
+readme = "README.md"
+exclude = [
+    ".github/**",
+    "tests/**",
+    "benches/**",
+    "benchmarks/**",
+    "examples/**",
+    "fuzz/**",
+    "clippy.toml",
+    "rustfmt.toml",
+    "Cargo.lock",
+    "CHANGELOG.md",
+    "USAGE.md",
+]
+
+[workspace]
+members = ["benchmarks"]
+# Plain `cargo test`/`clippy` at the root builds only the library package —
+# criterion (used solely by benches) lives in the benchmarks member.
+default-members = ["."]
+
+[features]
+default = []
+std = []
+serde = ["dep:serde"]
+serde_json = ["dep:serde_json", "serde"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["alloc"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# `thin` links our own benches/examples in seconds instead of the ~40s that
+# `fat` costs; dependents build the library with *their* profile anyway.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

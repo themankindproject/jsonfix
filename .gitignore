@@ -1,0 +1,49 @@
+# Build artifacts
+/target/
+fuzz/target/
+
+# Cargo lock (library crate — dependents resolve their own versions)
+Cargo.lock
+# …but the fuzz workspace is a binary crate: commit its lockfile so
+# libFuzzer builds are reproducible.
+!fuzz/Cargo.lock
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Benchmark output
+/target/criterion/
+
+# Coverage / profiling
+*.profraw
+tarpaulin-report.html
+lcov.info
+cobertura.xml
+
+# Local env
+.env
+.env.local
+
+# Fuzz: artifacts are crashers/minimized failures (never commit).
+fuzz/artifacts/
+# Corpus: hand-written seeds (seed_*, opts_*, steer_*) and regression inputs
+# (crash-*, regression_crash-*) are tracked. Everything else there is
+# libFuzzer's generated corpus (SHA-1 names): rebuilt by every fuzz run and
+# growing to tens of thousands of files, so it stays local.
+fuzz/corpus/*
+!fuzz/corpus/*/
+fuzz/corpus/*/*
+!fuzz/corpus/*/seed_*
+!fuzz/corpus/*/opts_*
+!fuzz/corpus/*/steer_*
+!fuzz/corpus/*/crash-*
+!fuzz/corpus/*/regression_crash-*

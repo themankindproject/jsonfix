@@ -1,0 +1,20 @@
+[package]
+name = "jsonfix-benchmarks"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Criterion lives here so plain `cargo test` on the workspace root does not
+# have to compile the criterion dependency tree.
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+jsonfix = { path = "..", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[[bench]]
+name = "repair"
+harness = false
+
+[[bench]]
+name = "stream"
+harness = false
