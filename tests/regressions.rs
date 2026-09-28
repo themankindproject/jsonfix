@@ -250,3 +250,83 @@ fn dropped_second_ndjson_value_leaves_the_first_intact() {
             .unwrap_or_else(|e| panic!("repair({input:?}) = {out:?} failed validate: {e}"));
     }
 }
+
+// --- Double-escape errors report positions in the caller's bytes ----------
+// The pre-pass feeds the parser an unescaped copy; without remapping, error
+// offsets pointed into that copy instead of the input the caller passed.
+
+#[test]
+fn double_escape_error_positions_map_back_to_the_input() {
+    // Byte 10 is the `{` of the second top-level value.
+    let input = r#"{\"a\": 1}{\"b\": 2}"#;
+    let error = jsonfix::repair(input).expect_err("two values, no separator");
+    assert_eq!(error.kind(), &jsonfix::ErrorKind::TrailingValue);
+    assert_eq!(error.position(), 10, "must point at the second value");
+    assert_eq!(input.as_bytes()[error.position()], b'{');
+
+    // `parse` takes the same path.
+    let error = jsonfix::parse(input).expect_err("two values, no separator");
+    assert_eq!(error.position(), 10);
+
+    // Trailing text after the value: byte 11 is the `x`.
+    let input = r#"{\"a\": 1} x"#;
+    let error = jsonfix::parse(input).expect_err("trailing text");
+    assert_eq!(error.position(), 11, "must point at the trailing `x`");
+    assert_eq!(input.as_bytes()[error.position()], b'x');
+}
+
+#[test]
+fn depth_scan_skip_does_not_weaken_the_limit() {
+    // The gate skips the post-render scan when the parser's depth bound
+    // proves the output fits; at and past the limit it must still run.
+    // Deep-but-fine input repairs; the NDJSON wrap past the limit is still
+    // rejected (covered by tests/depth.rs, re-asserted here for the gate).
+    let deep = format!(
+        "{}1{}",
+        "[".repeat(jsonfix::MAX_NESTING_DEPTH),
+        "]".repeat(jsonfix::MAX_NESTING_DEPTH)
+    );
+    jsonfix::repair(&deep).expect("depth == limit still repairs");
+    let ndjson = format!("{deep}\n2");
+    let err = jsonfix::repair(&ndjson).expect_err("wrap past limit rejected");
+    assert_eq!(err.kind(), &jsonfix::ErrorKind::DepthLimitExceeded);
+}
+
+// --- Value accessor/predicate surface ---------------------------------------
+// `as_u64` and the `is_*` predicates round out the accessor set; they must
+// agree with the variants they report on.
+
+#[test]
+fn value_predicates_and_u64_accessor_agree_with_variants() {
+    let doc = jsonfix::parse(
+        r#"{"null": null, "bool": true, "num": 18446744073709551615, "neg": -1, "str": "s", "arr": [], "obj": {}}"#,
+    )
+    .expect("repairs");
+
+    let get = |key: &str| doc.get(key).expect("member");
+
+    assert!(get("null").is_null() && !get("null").is_bool());
+    assert!(get("bool").is_bool() && !get("bool").is_null());
+    assert!(get("num").is_number() && get("num").as_u64() == Some(u64::MAX));
+    assert!(get("neg").as_u64().is_none(), "-1 is not a u64");
+    assert!(get("str").is_string() && get("str").as_str() == Some("s"));
+    assert!(get("arr").is_array() && get("arr").as_array() == Some(&[][..]));
+    assert!(get("obj").is_object() && get("obj").as_object() == Some(&[][..]));
+
+    // Exactly one predicate is true per value.
+    for key in ["null", "bool", "num", "str", "arr", "obj"] {
+        let value = get(key);
+        let hits = [
+            value.is_null(),
+            value.is_bool(),
+            value.is_number(),
+            value.is_string(),
+            value.is_array(),
+            value.is_object(),
+        ]
+        .iter()
+        .filter(|hit| **hit)
+        .count();
+        assert_eq!(hits, 1, "predicate count for {key}");
+    }
+}

@@ -9,7 +9,7 @@
 //! JSON parsers reject all of that. `jsonfix` accepts it, fixes it, and hands
 //! back valid JSON — with zero dependencies, no `unsafe`, and no `std`.
 //!
-//! ## The four verbs
+//! ## The five verbs
 //!
 //! | Function | Use it for |
 //! |---|---|
@@ -17,6 +17,7 @@
 //! | [`extract`] | pull the JSON value out of prose or a fenced block |
 //! | [`parse`] / [`parse_partial`] | get a [`Value`] tree, complete or still streaming |
 //! | [`StreamRepairer`] | repair a document that arrives chunk by chunk |
+//! | [`validate`] | strict check with byte-precise errors |
 //!
 //! ```
 //! use jsonfix::{extract, parse, repair, repair_extract};
@@ -114,6 +115,14 @@ mod stream;
 mod swar;
 mod value;
 
+/// The README's Rust examples, compiled and run as doctests so they cannot
+/// rot silently (markdown files are not doctested by default). Gated on the
+/// feature set the README assumes; CI's doctest job runs `--all-features`.
+#[cfg(all(doctest, feature = "serde_json", feature = "std"))]
+#[doc = include_str!("../README.md")]
+#[allow(dead_code)]
+struct ReadmeDoctests;
+
 #[cfg(feature = "serde_json")]
 mod serde_json_support;
 #[cfg(feature = "serde")]
@@ -141,16 +150,34 @@ pub use serde_support::from_value;
 /// let value = parse("{name: 'Ada', tags: ['math', 'code',],}").unwrap();
 /// assert_eq!(value.to_json_string(), r#"{"name": "Ada", "tags": ["math", "code"]}"#);
 /// ```
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` cannot be repaired into a single JSON
+/// value.
 pub fn parse(input: &str) -> Result<Value, Error> {
     parse_with(input, Options::all())
 }
 
 /// Like [`parse`], with explicit [`Options`].
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` cannot be repaired under `opts`.
 pub fn parse_with(input: &str, opts: Options) -> Result<Value, Error> {
     // A whole document that was escaped once too often, such as `{\"a\": 1}`.
     if opts.repairs(Repairs::UNQUOTED) && looks_double_escaped(input) {
         let unescaped = unescape_once(input);
-        return parser::Parser::new(&unescaped, opts).parse_document();
+        return parser::Parser::new(&unescaped, opts)
+            .parse_document()
+            // The parser saw the rewritten copy; report positions in the
+            // bytes the caller actually passed in.
+            .map_err(|error| {
+                Error::new(
+                    error.kind().clone(),
+                    unescaped_position(input, error.position()),
+                )
+            });
     }
     parser::Parser::new(input, opts).parse_document()
 }
@@ -159,6 +186,10 @@ pub fn parse_with(input: &str, opts: Options) -> Result<Value, Error> {
 ///
 /// Pass `Options::partial(Allow::OBJ | Allow::STR)` (or any other [`Allow`]
 /// combination) to keep values that are still being written.
+///
+/// # Errors
+///
+/// Returns an [`Error`] if the input cannot be repaired under `opts`.
 pub fn parse_partial(input: &str, opts: Options) -> Result<Value, Error> {
     parse_with(input, opts)
 }
@@ -171,6 +202,11 @@ pub fn parse_partial(input: &str, opts: Options) -> Result<Value, Error> {
 /// assert!(validate("[1, 2, 3]").is_ok());
 /// assert!(validate("[1, 2, 3,]").is_err());
 /// ```
+///
+/// # Errors
+///
+/// Returns an [`Error`] on the first strict-JSON violation, carrying the
+/// offending [`ErrorKind`] and byte offset.
 pub fn validate(input: &str) -> Result<Value, Error> {
     parse_with(input, Options::strict())
 }
@@ -182,11 +218,19 @@ pub fn validate(input: &str) -> Result<Value, Error> {
 ///
 /// assert_eq!(repair("{a: 1, /* note */ b: 'two',}").unwrap(), r#"{"a": 1, "b": "two"}"#);
 /// ```
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` cannot be repaired into valid JSON.
 pub fn repair(input: &str) -> Result<String, Error> {
     repair_with(input, Options::all())
 }
 
 /// Like [`repair`], with explicit [`Options`].
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` cannot be repaired under `opts`.
 pub fn repair_with(input: &str, opts: Options) -> Result<String, Error> {
     let mut out = String::with_capacity(input.len());
     repair_into(input, &mut out, opts)?;
@@ -197,6 +241,11 @@ pub fn repair_with(input: &str, opts: Options) -> Result<String, Error> {
 ///
 /// The buffer is left untouched (trimmed back to its previous length) when
 /// repair fails.
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` cannot be repaired; `out` is left at its
+/// previous length.
 pub fn repair_into(input: &str, out: &mut String, opts: Options) -> Result<(), Error> {
     repair_document_into(input, opts, out, None)
 }
@@ -216,11 +265,21 @@ pub fn repair_into(input: &str, out: &mut String, opts: Options) -> Result<(), E
 /// let out = jsonfix::repair_bytes(b"{a: 1,}").unwrap();
 /// assert_eq!(out, br#"{"a": 1}"#);
 /// ```
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` is not valid UTF-8
+/// ([`ErrorKind::InvalidUtf8`] at the first bad byte) or cannot be repaired.
 pub fn repair_bytes(input: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
     repair_bytes_with(input, Options::all())
 }
 
 /// Like [`repair_bytes`], with explicit [`Options`].
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` is not valid UTF-8 or cannot be repaired
+/// under `opts`.
 pub fn repair_bytes_with(input: &[u8], opts: Options) -> Result<alloc::vec::Vec<u8>, Error> {
     let mut out = alloc::vec::Vec::with_capacity(input.len());
     repair_bytes_into(input, &mut out, opts)?;
@@ -231,6 +290,11 @@ pub fn repair_bytes_with(input: &[u8], opts: Options) -> Result<alloc::vec::Vec<
 ///
 /// The buffer is left untouched (trimmed back to its previous length) when
 /// the repair fails or the input is not valid UTF-8.
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `input` is not valid UTF-8 or the repair fails;
+/// `out` is left at its previous length.
 pub fn repair_bytes_into(
     input: &[u8],
     out: &mut alloc::vec::Vec<u8>,
@@ -270,10 +334,16 @@ pub(crate) fn repair_document_into(
     cp: Option<&mut parser::ResumeCp>,
 ) -> Result<(), Error> {
     let start = out.len();
+    // Set on the stream path: the parser's high-water nesting, used to skip
+    // the post-render depth scan when the output provably fits.
+    let mut max_depth: Option<usize> = None;
+    // Set when the double-escape pre-pass rewrote the input, so error
+    // positions can be mapped back to the caller's bytes.
+    let mut double_escaped = false;
     let result = if opts.allows(Allow::ALL) {
         // A whole document that was escaped once too often, such as `{\"a\": 1}`.
+        double_escaped = opts.repairs(Repairs::UNQUOTED) && looks_double_escaped(input);
         let unescaped;
-        let double_escaped = opts.repairs(Repairs::UNQUOTED) && looks_double_escaped(input);
         let effective: &str = if double_escaped {
             unescaped = unescape_once(input);
             &unescaped
@@ -284,7 +354,9 @@ pub(crate) fn repair_document_into(
         // invalidate their offsets, so they are disabled for that path.
         let cp = if double_escaped { None } else { cp };
         let mut parser = parser::Parser::new_stream(effective, opts, out, cp);
-        parser.parse_document_stream()
+        let result = parser.parse_document_stream();
+        max_depth = Some(parser.max_depth());
+        result
     } else {
         parse_with(input, opts).map(|value| value.write_to(out))
     };
@@ -293,8 +365,17 @@ pub(crate) fn repair_document_into(
             // Post-condition: anything we emit must survive `validate`,
             // including its `MAX_NESTING_DEPTH` check (the NDJSON wrap can
             // add a level `enter()` never counted — also guard here so no
-            // path can skip the explicit checks).
-            if parser::structural_depth(&out[start..]) > parser::MAX_NESTING_DEPTH {
+            // path can skip the explicit checks). `max_depth` (stream path)
+            // upper-bounds the rendered structural depth, so the scan is
+            // skipped unless even that bound cannot rule the output in:
+            // reserving one level for a possible NDJSON `[` wrap keeps the
+            // skip sound (a group frame that emitted no bracket only makes
+            // the bound more conservative).
+            let scan_needed = match max_depth {
+                Some(depth) => depth + 1 > parser::MAX_NESTING_DEPTH,
+                None => true,
+            };
+            if scan_needed && parser::structural_depth(&out[start..]) > parser::MAX_NESTING_DEPTH {
                 out.truncate(start);
                 return Err(Error::new(
                     crate::ErrorKind::DepthLimitExceeded,
@@ -305,7 +386,12 @@ pub(crate) fn repair_document_into(
         }
         Err(error) => {
             out.truncate(start);
-            Err(error)
+            let position = if double_escaped {
+                unescaped_position(input, error.position())
+            } else {
+                error.position()
+            };
+            Err(Error::new(error.kind().clone(), position))
         }
     }
 }
@@ -462,6 +548,11 @@ impl From<std::io::Error> for WriteError {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// Returns [`WriteError::Repair`] when `input` cannot be repaired (the sink
+/// is untouched) or [`WriteError::Write`] when the sink rejects the bytes.
 #[cfg(feature = "std")]
 pub fn repair_to_writer(
     input: &str,
@@ -483,6 +574,11 @@ pub fn repair_to_writer(
 /// let reply = "The result is {\"ok\": true,} — done.";
 /// assert_eq!(jsonfix::repair_extract(reply).unwrap(), r#"{"ok": true}"#);
 /// ```
+///
+/// # Errors
+///
+/// Returns an [`Error`] when neither the extracted span nor the whole input
+/// can be repaired.
 pub fn repair_extract(input: &str) -> Result<String, Error> {
     match extract(input) {
         Some(span) => repair(span).or_else(|_| repair(input)),
@@ -494,11 +590,12 @@ pub fn repair_extract(input: &str) -> Result<String, Error> {
 ///
 /// The test is deliberately conservative: `\"` must appear and no unescaped
 /// `"` may be present, so a valid JSON string such as `"{\"a\": 1}"` is left
-/// alone.
+/// alone. It bails out at the first raw `"`: a raw quote anywhere makes the
+/// whole-input verdict false, so most documents are decided after a few bytes
+/// rather than a full scan.
 fn looks_double_escaped(input: &str) -> bool {
     let bytes = input.as_bytes();
     let mut escaped_quotes = 0usize;
-    let mut raw_quotes = 0usize;
     for (index, byte) in bytes.iter().enumerate() {
         if *byte != b'"' {
             continue;
@@ -511,10 +608,10 @@ fn looks_double_escaped(input: &str) -> bool {
         if backslashes % 2 == 1 {
             escaped_quotes += 1;
         } else {
-            raw_quotes += 1;
+            return false;
         }
     }
-    escaped_quotes > 0 && raw_quotes == 0
+    escaped_quotes > 0
 }
 
 /// Incremental [`looks_double_escaped`] verdict for streaming callers.
@@ -635,6 +732,46 @@ fn unescape_once(input: &str) -> String {
         }
     }
     out
+}
+
+/// Maps a byte offset in the [`unescape_once`] rewrite back to a byte offset
+/// in the original input.
+///
+/// The rewrite only changes lengths for one-byte escapes (`\"` → `"` and
+/// friends, two input bytes to one output byte); every other unit keeps its
+/// length, so offsets inside it map one-to-one. An offset landing on a
+/// shortened escape maps to the escape's backslash.
+fn unescaped_position(input: &str, position: usize) -> usize {
+    let mut out = 0usize;
+    let mut chars = input.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        let (orig_len, out_len) = if c != '\\' {
+            (c.len_utf8(), c.len_utf8())
+        } else {
+            match chars.peek() {
+                Some(&(_, next)) => {
+                    chars.next();
+                    if matches!(next, '"' | '\\' | '\'' | '/' | 'n' | 'r' | 't' | 'b' | 'f') {
+                        (2, 1)
+                    } else {
+                        let len = 1 + next.len_utf8();
+                        (len, len)
+                    }
+                }
+                None => (1, 1),
+            }
+        };
+        if out + out_len > position {
+            return start
+                + if orig_len == out_len {
+                    position - out
+                } else {
+                    0
+                };
+        }
+        out += out_len;
+    }
+    input.len()
 }
 
 #[cfg(test)]

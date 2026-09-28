@@ -168,6 +168,13 @@ fn number(text: String) -> Value {
 /// does not fit the target errors instead of being silently narrowed. For
 /// the string-keeping variant see [`Value::to_serde_json`](crate::Value::to_serde_json),
 /// which powers [`loads`](crate::loads).
+///
+/// # Errors
+///
+/// Returns a [`serde::de::value::Error`] when the value does not match `T`:
+/// a type mismatch, a float target with a value outside the finite `f64`
+/// range (`1e400`), or number text that does not parse as the target numeric
+/// type.
 pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, serde::de::value::Error> {
     T::deserialize(value)
 }

@@ -200,6 +200,11 @@ pub(crate) struct Parser<'a, 'b> {
     opts: Options,
     /// Open containers (also the depth counter for [`MAX_NESTING_DEPTH`]).
     frames: Vec<Frame>,
+    /// High-water mark of `frames.len()`: the deepest the renderer could have
+    /// nested. Groups count here but emit no brackets, so this can only
+    /// over-state the rendered structural depth — a safe basis for skipping
+    /// the post-render depth scan.
+    max_depth: usize,
     top: TopState,
     out: Option<&'b mut String>,
     /// Where checkpoints are recorded (stream mode with a live renderer).
@@ -219,6 +224,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             peeked: None,
             opts,
             frames: Vec::new(),
+            max_depth: 0,
             top: TopState::default(),
             out: None,
             cp_slot: None,
@@ -240,6 +246,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             peeked: None,
             opts,
             frames: Vec::new(),
+            max_depth: 0,
             top: TopState::default(),
             out: Some(out),
             cp_slot: cp,
@@ -260,17 +267,25 @@ impl<'a, 'b> Parser<'a, 'b> {
         let phase = cp.phase;
         let mut lexer = Lexer::new(input, opts);
         lexer.set_pos(cp.input_pos);
+        let frames = cp.frames.clone();
+        let max_depth = frames.len();
         Self {
             lexer,
             peeked: None,
             opts,
-            frames: cp.frames.clone(),
+            frames,
+            max_depth,
             top: cp.top,
             out: Some(out),
             cp_slot: Some(cp),
             resume_phase: Some(phase),
             eof_dependent: false,
         }
+    }
+
+    /// The deepest `frames.len()` reached so far (see the field docs).
+    pub(crate) fn max_depth(&self) -> usize {
+        self.max_depth
     }
 
     /// Whether values are serialized directly instead of built into a tree.
@@ -368,6 +383,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             first: true,
             comma_pending: false,
         });
+        self.max_depth = self.max_depth.max(self.frames.len());
         Ok(())
     }
 

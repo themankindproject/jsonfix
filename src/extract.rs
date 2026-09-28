@@ -38,6 +38,7 @@ fn is_value_start(c: char, next: Option<char>) -> bool {
 /// let text = "Sure! Here is the data:\n```json\n{\"ok\": true}\n```\nEnjoy.";
 /// assert_eq!(jsonfix::extract(text), Some("{\"ok\": true}"));
 /// ```
+#[must_use]
 pub fn extract(input: &str) -> Option<&str> {
     if let Some((start, end)) = fenced_block(input) {
         return Some(input[start..end].trim());
@@ -56,6 +57,7 @@ pub fn extract(input: &str) -> Option<&str> {
 /// assert_eq!(jsonfix::extract_partial("partial: {\"a\": [1, 2"), "{\"a\": [1, 2");
 /// assert_eq!(jsonfix::extract_partial("no json yet"), "");
 /// ```
+#[must_use]
 pub fn extract_partial(input: &str) -> &str {
     match first_value_start(input) {
         Some(start) => &input[start..],
@@ -69,6 +71,7 @@ pub fn extract_partial(input: &str) -> &str {
 /// let log = "{\"n\": 1}\n{\"n\": 2}";
 /// assert_eq!(jsonfix::extract_all(log), vec!["{\"n\": 1}", "{\"n\": 2}"]);
 /// ```
+#[must_use]
 pub fn extract_all(input: &str) -> Vec<&str> {
     let mut values = Vec::new();
     let mut pos = 0usize;

@@ -27,8 +27,15 @@ jobs:
       # tests/examples that only compiles under --all-features.
       - run: cargo test
       # no_std compatibility: the crate itself must build with nothing but
-      # `alloc` (the optional serde deps are declared alloc-only as well).
+      # `alloc` (the optional serde deps are declared alloc-only as well),
+      # and the alloc-only test surface must pass.
       - run: cargo check --no-default-features
+      - run: cargo test --no-default-features
+      # Each optional feature must also build on its own — catches a feature
+      # that silently relies on another being enabled alongside it.
+      - run: cargo check --features std
+      - run: cargo check --features serde
+      - run: cargo check --features serde_json
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
@@ -73,7 +80,8 @@ jobs:
 
   # cargo-fuzz: nightly + libFuzzer. Compiles every target and runs a short
   # smoke pass so a harness that no longer builds (or a seed that crashes)
-  # fails the PR. Longer runs belong in a scheduled workflow, not here.
+  # fails the PR. Longer runs live in fuzz-scheduled.yml (nightly, or on
+  # demand via workflow_dispatch).
   fuzz:
     name: fuzz (build + smoke)
     runs-on: ubuntu-latest

@@ -20,11 +20,16 @@ all listed as additions.
   prose, markdown fences, and log lines.
 - `StreamRepairer` with `push` / `push_delta` for incremental (LLM token)
   input, `Delta { keep, text }` for cheap re-renders.
-- `Value` tree with lossless `Number` text, `pointer` (RFC 6901), and
-  `write_to`/`to_json_string` rendering.
+- `Value` tree with lossless `Number` text, `pointer` (RFC 6901),
+  `write_to`/`to_json_string` rendering, and a closed set of six kinds —
+  exhaustive `match` over it is stable.
+- `Value` accessors and predicates: `as_u64` joins `as_i64`/`as_f64`, and
+  `is_bool`/`is_number`/`is_string`/`is_array`/`is_object` join `is_null`.
 - `Repairs` bitmask (12 passes) and `Allow` bitmask (partial-json semantics).
 - Byte-precise `Error`/`ErrorKind` with `Display` messages and stable
   `message()` text.
+- Every public accessor and builder is `#[must_use]`, and every fallible
+  function documents its failure modes under `# Errors`.
 - `MAX_NESTING_DEPTH` cap and `ErrorKind::DepthLimitExceeded` so deeply nested
   input fails cleanly instead of overflowing the stack.
 
@@ -68,6 +73,8 @@ all listed as additions.
 - The NDJSON `[` wrap (stream and tree mode) counts against
   `MAX_NESTING_DEPTH`, and `repair_document_into` post-checks structural depth
   of its output — repair output never exceeds the depth `validate` accepts.
+- Errors on double-escaped documents (`{\"a\": 1}`) report byte offsets in the
+  caller's input; positions from the parser's unescaped copy are mapped back.
 - `StreamRepairer` checkpoints are invalidated whenever a later chunk can
   change how earlier bytes parse: NDJSON `[` retrofit, first backtick (a
   fence can re-interpret earlier bytes), and failed pushes (the chunk is
@@ -127,11 +134,24 @@ all listed as additions.
   claim. Release `lto` is `thin` (own bench/example links ~4× faster than
   `fat`); benchmarks live in a `benchmarks` workspace member so plain
   `cargo test` does not compile the criterion dependency tree.
+- Repair no longer pays two whole-buffer scans per call: the post-render
+  depth check is skipped when the parser's high-water nesting (plus one
+  reserved NDJSON `[` level) proves the output fits `MAX_NESTING_DEPTH`, and
+  the double-escape pre-pass stops at the first raw quote instead of scanning
+  the whole input. Back-to-back A/B on `repair/fenced_body`: ~310–313 μs →
+  ~276–279 μs (≈10–12%).
 
 **Tooling**
 
 - `cargo-fuzz` harness under `fuzz/` with seven targets (`repair`, `parse`,
   `extract`, `stream`, `options`, `bytes`, `from_value`) and a committed seed
-  corpus. CI builds the harness and runs a short smoke pass on every PR.
+  corpus. CI builds the harness and runs a short smoke pass on every PR;
+  `.github/workflows/fuzz-scheduled.yml` runs 10-minute passes per target
+  nightly (or on demand via `workflow_dispatch`) and uploads crash artifacts.
 - Criterion benchmarks (`benchmarks/benches/repair.rs`, `stream.rs`) for the
   one-shot repair and streaming paths.
+- CI covers the feature matrix explicitly: default, `--all-features`,
+  `--no-default-features` (check + test), and each optional feature alone
+  (`std`, `serde`, `serde_json`).
+- The README's Rust examples run as doctests (`#[doc = include_str!(...)]`
+  under `cfg(doctest)`), so they cannot rot silently.

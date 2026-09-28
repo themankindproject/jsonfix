@@ -48,11 +48,21 @@ impl From<Error> for DeserializeError {
 /// let reply: Reply = jsonfix::deserialize("{answer: 'yes', score: 0.9,}").unwrap();
 /// assert_eq!(reply.answer, "yes");
 /// ```
+///
+/// # Errors
+///
+/// Returns [`DeserializeError::Repair`] when `input` cannot be repaired, or
+/// [`DeserializeError::Json`] when the repaired JSON does not match `T`.
 pub fn deserialize<T: DeserializeOwned>(input: &str) -> Result<T, DeserializeError> {
     deserialize_with(input, Options::all())
 }
 
 /// Like [`deserialize`], with explicit [`Options`].
+///
+/// # Errors
+///
+/// Returns [`DeserializeError`] when `input` cannot be repaired under `opts`
+/// or the repaired JSON does not match `T`.
 pub fn deserialize_with<T: DeserializeOwned>(
     input: &str,
     opts: Options,
@@ -75,11 +85,21 @@ pub fn deserialize_with<T: DeserializeOwned>(
 /// let value = jsonfix::loads("{name: 'Ada', age: 36,}").unwrap();
 /// assert_eq!(value["name"], "Ada");
 /// ```
+///
+/// # Errors
+///
+/// Returns [`DeserializeError`] only when `input` cannot be repaired —
+/// rendering to `serde_json::Value` itself does not fail.
 pub fn loads(input: &str) -> Result<JsonValue, DeserializeError> {
     loads_with(input, Options::all())
 }
 
 /// Like [`loads`], with explicit [`Options`].
+///
+/// # Errors
+///
+/// Returns [`DeserializeError`] when `input` cannot be repaired under `opts`;
+/// rendering itself does not fail.
 pub fn loads_with(input: &str, opts: Options) -> Result<JsonValue, DeserializeError> {
     let value = crate::parse_with(input, opts)?;
     Ok(value.to_serde_json())

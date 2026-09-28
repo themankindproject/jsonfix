@@ -39,26 +39,31 @@ impl Allow {
     pub const NONE: Allow = Allow::NOTHING;
 
     /// Whether every flag in `other` is present in `self`.
+    #[must_use]
     pub const fn contains(self, other: Allow) -> bool {
         (self.0 & other.0) == other.0
     }
 
     /// Whether no flag is set.
+    #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
     /// The raw bitmask.
+    #[must_use]
     pub const fn bits(self) -> u16 {
         self.0
     }
 
     /// Set union.
+    #[must_use]
     pub const fn union(self, other: Allow) -> Allow {
         Allow(self.0 | other.0)
     }
 
     /// Set difference.
+    #[must_use]
     pub const fn without(self, other: Allow) -> Allow {
         Allow(self.0 & !other.0)
     }
@@ -123,21 +128,25 @@ impl Repairs {
     pub const ALL: Repairs = Repairs(0b1111_1111_1111);
 
     /// Whether every flag in `other` is present in `self`.
+    #[must_use]
     pub const fn contains(self, other: Repairs) -> bool {
         (self.0 & other.0) == other.0
     }
 
     /// The raw bitmask.
+    #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
     }
 
     /// Set union.
+    #[must_use]
     pub const fn union(self, other: Repairs) -> Repairs {
         Repairs(self.0 | other.0)
     }
 
     /// Set difference.
+    #[must_use]
     pub const fn without(self, other: Repairs) -> Repairs {
         Repairs(self.0 & !other.0)
     }
@@ -181,11 +190,13 @@ impl Options {
     };
 
     /// Repair everything, keep every incomplete trailing value.
+    #[must_use]
     pub const fn all() -> Self {
         Self::ALL
     }
 
     /// No repairs, nothing incomplete: the input must be valid JSON.
+    #[must_use]
     pub const fn strict() -> Self {
         Self {
             allow: Allow::NOTHING,
@@ -194,6 +205,7 @@ impl Options {
     }
 
     /// Full repair with an explicit partial-parsing policy.
+    #[must_use]
     pub const fn partial(allow: Allow) -> Self {
         Self {
             allow,
@@ -202,23 +214,27 @@ impl Options {
     }
 
     /// Replaces the repair mask.
+    #[must_use]
     pub const fn with_repairs(mut self, repairs: Repairs) -> Self {
         self.repairs = repairs;
         self
     }
 
     /// Replaces the partial-parsing policy.
+    #[must_use]
     pub const fn with_allow(mut self, allow: Allow) -> Self {
         self.allow = allow;
         self
     }
 
     /// Whether the `flag` repair pass is enabled.
+    #[must_use]
     pub const fn repairs(self, flag: Repairs) -> bool {
         self.repairs.contains(flag)
     }
 
     /// Whether the `flag` partial value is allowed.
+    #[must_use]
     pub const fn allows(self, flag: Allow) -> bool {
         self.allow.contains(flag)
     }

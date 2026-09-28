@@ -46,21 +46,25 @@ pub struct Error {
 
 impl Error {
     /// Builds an error from a kind and a byte offset into the input.
+    #[must_use]
     pub const fn new(kind: ErrorKind, position: usize) -> Self {
         Self { kind, position }
     }
 
     /// Returns the class of failure.
+    #[must_use]
     pub const fn kind(&self) -> &ErrorKind {
         &self.kind
     }
 
     /// Returns the byte offset (0-based) into the input where the failure was detected.
+    #[must_use]
     pub const fn position(&self) -> usize {
         self.position
     }
 
     /// Returns a stable, human-readable message for this error.
+    #[must_use]
     pub fn message(&self) -> &'static str {
         match self.kind {
             ErrorKind::UnexpectedEnd => "unexpected end of input",

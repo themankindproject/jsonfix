@@ -66,11 +66,13 @@ pub struct StreamRepairer {
 
 impl StreamRepairer {
     /// A stream repairer that runs every repair pass.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_options(Options::all())
     }
 
     /// A stream repairer with explicit options, e.g. a partial policy.
+    #[must_use]
     pub fn with_options(opts: Options) -> Self {
         Self {
             input: String::new(),
@@ -112,6 +114,10 @@ impl StreamRepairer {
     /// directly on every token. If the accumulated input cannot be repaired,
     /// the chunk is rolled back and the error is returned — the stream still
     /// holds the last state that parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the accumulated input cannot be repaired.
     pub fn push(&mut self, chunk: &str) -> Result<&str, Error> {
         let before = self.input.len();
         self.note_chunk(chunk);
@@ -167,6 +173,10 @@ impl StreamRepairer {
     ///
     /// Apply it by truncating your buffer to [`Delta::keep`] and appending
     /// [`Delta::text`]. On error the chunk is rolled back, as in [`push`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the accumulated input cannot be repaired.
     ///
     /// [`push`]: Self::push
     pub fn push_delta(&mut self, chunk: &str) -> Result<Delta<'_>, Error> {
@@ -243,26 +253,34 @@ impl StreamRepairer {
     }
 
     /// Parses everything pushed so far.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the accumulated input cannot be repaired.
     pub fn value(&self) -> Result<Value, Error> {
         crate::parse_with(&self.input, self.opts)
     }
 
     /// The raw input accumulated so far.
+    #[must_use]
     pub fn input(&self) -> &str {
         &self.input
     }
 
     /// The repaired output produced by the last [`push`](Self::push).
+    #[must_use]
     pub fn output(&self) -> &str {
         &self.current
     }
 
     /// Number of input bytes accumulated.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.input.len()
     }
 
     /// Whether nothing has been pushed yet.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.input.is_empty()
     }

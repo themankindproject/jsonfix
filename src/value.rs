@@ -18,21 +18,25 @@ impl Number {
     }
 
     /// The number exactly as it will be emitted.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Parses the number as `f64`.
+    #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
         self.0.parse().ok()
     }
 
     /// Parses the number as `i64` when it is a plain integer.
+    #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         self.0.parse().ok()
     }
 
     /// Parses the number as `u64` when it is a plain non-negative integer.
+    #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         self.0.parse().ok()
     }
@@ -45,6 +49,9 @@ impl fmt::Display for Number {
 }
 
 /// A repaired, parsed JSON value.
+///
+/// The six kinds mirror JSON itself and are complete: `Value` is a closed
+/// enum, so exhaustive matches are stable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// `null`.
@@ -63,6 +70,7 @@ pub enum Value {
 
 impl Value {
     /// Returns the string contents when this is a [`Value::String`].
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s),
@@ -71,6 +79,7 @@ impl Value {
     }
 
     /// Returns the boolean when this is a [`Value::Bool`].
+    #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
@@ -79,6 +88,7 @@ impl Value {
     }
 
     /// Returns the number when this is a [`Value::Number`].
+    #[must_use]
     pub fn as_number(&self) -> Option<&Number> {
         match self {
             Value::Number(n) => Some(n),
@@ -87,16 +97,26 @@ impl Value {
     }
 
     /// Returns the number as `f64` when this is a [`Value::Number`].
+    #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
         self.as_number()?.as_f64()
     }
 
     /// Returns the number as `i64` when this is an integer [`Value::Number`].
+    #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         self.as_number()?.as_i64()
     }
 
+    /// Returns the number as `u64` when this is a non-negative integer
+    /// [`Value::Number`].
+    #[must_use]
+    pub fn as_u64(&self) -> Option<u64> {
+        self.as_number()?.as_u64()
+    }
+
     /// Returns the elements when this is a [`Value::Array`].
+    #[must_use]
     pub fn as_array(&self) -> Option<&[Value]> {
         match self {
             Value::Array(a) => Some(a),
@@ -105,6 +125,7 @@ impl Value {
     }
 
     /// Returns the key/value pairs when this is a [`Value::Object`].
+    #[must_use]
     pub fn as_object(&self) -> Option<&[(String, Value)]> {
         match self {
             Value::Object(o) => Some(o),
@@ -113,6 +134,7 @@ impl Value {
     }
 
     /// Looks up a key in an object (first match wins).
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.as_object()?
             .iter()
@@ -120,6 +142,7 @@ impl Value {
     }
 
     /// Looks up an index in an array.
+    #[must_use]
     pub fn index(&self, index: usize) -> Option<&Value> {
         self.as_array()?.get(index)
     }
@@ -127,6 +150,7 @@ impl Value {
     /// Resolves an RFC 6901 JSON pointer such as `/choices/0/text`.
     ///
     /// An empty pointer resolves to `self`.
+    #[must_use]
     pub fn pointer(&self, pointer: &str) -> Option<&Value> {
         if pointer.is_empty() {
             return Some(self);
@@ -144,6 +168,7 @@ impl Value {
     }
 
     /// Number of elements or members; `0` for scalars.
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Value::Array(a) => a.len(),
@@ -153,11 +178,43 @@ impl Value {
     }
 
     /// Whether this value is [`Value::Null`].
+    #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
 
+    /// Whether this value is [`Value::Bool`].
+    #[must_use]
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Value::Bool(_))
+    }
+
+    /// Whether this value is [`Value::Number`].
+    #[must_use]
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Number(_))
+    }
+
+    /// Whether this value is [`Value::String`].
+    #[must_use]
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+
+    /// Whether this value is [`Value::Array`].
+    #[must_use]
+    pub fn is_array(&self) -> bool {
+        matches!(self, Value::Array(_))
+    }
+
+    /// Whether this value is [`Value::Object`].
+    #[must_use]
+    pub fn is_object(&self) -> bool {
+        matches!(self, Value::Object(_))
+    }
+
     /// Whether this value is an empty array, an empty object, or a scalar.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -196,6 +253,7 @@ impl Value {
     }
 
     /// Renders this value as canonical compact JSON.
+    #[must_use]
     pub fn to_json_string(&self) -> String {
         let mut out = String::with_capacity(32);
         self.write_to(&mut out);

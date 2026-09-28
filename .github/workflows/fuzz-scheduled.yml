@@ -1,0 +1,42 @@
+name: Fuzz (scheduled)
+
+# Long-running fuzz passes live here, not in ci.yml: the PR smoke run stays
+# fast, while these get real fuzzing time on a schedule (or on demand).
+on:
+  schedule:
+    # Nightly at 03:00 UTC.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-long:
+    name: fuzz ${{ matrix.target }} (10 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [repair, parse, extract, stream, options, bytes, from_value]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Same pinned triple as ci.yml (cargo-fuzz's default varies between its
+      # release binaries; the gnu triple is the host and always has its std).
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=600 -max_len=8192
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

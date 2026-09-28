@@ -382,7 +382,7 @@ public; `ErrorKind`, `WriteError`, and `DeserializeError` are
 
 | Type | Shape | Methods / fields |
 |---|---|---|
-| `Value` | `Null`, `Bool`, `Number`, `String`, `Array(Vec<Value>)`, `Object(Vec<(String, Value)>)` | `as_str`, `as_bool`, `as_number`, `as_f64`, `as_i64`, `as_array`, `as_object`, `get`, `index`, `pointer`, `len`, `is_null`, `is_empty`, `write_to`, `to_json_string`, `to_serde_json` / `from_serde_json` *(serde_json)* |
+| `Value` | `Null`, `Bool`, `Number`, `String`, `Array(Vec<Value>)`, `Object(Vec<(String, Value)>)` | `as_str`, `as_bool`, `as_number`, `as_f64`, `as_i64`, `as_u64`, `as_array`, `as_object`, `get`, `index`, `pointer`, `len`, `is_null`, `is_bool`, `is_number`, `is_string`, `is_array`, `is_object`, `is_empty`, `write_to`, `to_json_string`, `to_serde_json` / `from_serde_json` *(serde_json)* |
 | `Number` | the original digit text | `as_str`, `as_f64`, `as_i64`, `as_u64` |
 | `Options` | `allow: Allow`, `repairs: Repairs` | `all`, `strict`, `partial`, `with_repairs`, `with_allow`, `repairs`, `allows` |
 | `Allow` | `NOTHING`/`NONE`, `STR`, `NUM`, `ARR`, `OBJ`, `KEY`, `BOOL`, `NULL`, `ATOM`, `COLLECTION`, `ALL` | `contains`, `is_empty`, `bits`, `union`, `without`, `BitOr` |
@@ -414,6 +414,21 @@ The row that matters for LLM pipelines: when a stream truncates mid-number,
 `jsonfix` keeps the digits it saw and reports byte-exact offsets — no other
 crate in the table promises either.
 
+## Performance
+
+On the 13.2 KB fenced-LLM-reply fixture from the bench suite (`cargo bench -p
+jsonfix-benchmarks --bench repair`):
+
+| Operation | Time | Throughput |
+|---|---|---|
+| `repair` | ~276–283 μs | ~44–46 MiB/s |
+| `repair_extract` | ~282–290 μs | ~43–45 MiB/s |
+
+For context on the same machine, `validate` costs about the same as `repair`,
+and both are ≈2× a native `serde_json::from_str` on the repaired output
+(~190 μs). Numbers are single-machine criterion medians and move with the
+machine; the ratios are the claim.
+
 ## No standard library required
 
 `#![no_std]` with `alloc` only, and `#![forbid(unsafe_code)]` — which matters
@@ -427,7 +442,7 @@ optional `serde`/`serde_json` features are declared `default-features = false`
 $ cargo test --all-features                   # full suite + doctests
 $ cargo test --no-default-features --lib      # alloc-only surface
 $ cargo clippy --all-targets --all-features -- -D warnings
-$ cargo run --release -p jsonfix-benchmarks --bench repair   # criterion
+$ cargo bench -p jsonfix-benchmarks --bench repair            # criterion
 $ cargo +nightly fuzz run repair -- -runs=50000              # harness in fuzz/
 ```
 

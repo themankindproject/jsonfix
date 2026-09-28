@@ -6,11 +6,9 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Repair, extract, and partially parse malformed JSON from LLMs and other unreliable sources. no_std, zero dependencies, lossless numbers."
 repository = "https://github.com/themankindproject/jsonfix"
-homepage = "https://github.com/themankindproject/jsonfix"
-authors = ["bravo1goingdark <kumarashutosh34169@gmail.com>"]
+authors = ["Ashutosh Kumar <kumarashutosh34169@gmail.com>"]
 keywords = ["json", "repair", "llm", "streaming", "no-std"]
 categories = ["parsing", "no-std", "development-tools"]
-readme = "README.md"
 exclude = [
     ".github/**",
     "tests/**",
@@ -22,7 +20,6 @@ exclude = [
     "rustfmt.toml",
     "Cargo.lock",
     "CHANGELOG.md",
-    "USAGE.md",
 ]
 
 [workspace]
