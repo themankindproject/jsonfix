@@ -5,10 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Nothing has been released yet: everything below ships with `0.1.0`, so it is
-all listed as additions.
+## [Unreleased]
 
 ## [0.1.0] - 2026-09-29
+
+First public release: everything below is new in `0.1.0`.
 
 ### Added
 
@@ -219,3 +220,14 @@ all listed as additions.
   (`std`, `serde`, `serde_json`).
 - The README's Rust examples run as doctests (`#[doc = include_str!(...)]`
   under `cfg(doctest)`), so they cannot rot silently.
+- The published crate is an explicit allowlist (`include` in `Cargo.toml`):
+  library source, manifest, README, and licenses only. Tests, examples,
+  benches, fuzz harnesses, and CI/tooling config never reach dependents,
+  and the default feature set pulls in no dependencies at all.
+- The optional `serde` / `serde_json` dependencies declare the oldest
+  releases verified to build the crate (`serde >= 1.0.100`,
+  `serde_json >= 1.0.45`, the first with an `alloc` feature), checked with
+  `cargo update -Z direct-minimal-versions`.
+
+[Unreleased]: https://github.com/themankindproject/jsonfix/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/themankindproject/jsonfix/releases/tag/v0.1.0

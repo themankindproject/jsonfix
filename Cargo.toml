@@ -9,18 +9,11 @@ repository = "https://github.com/themankindproject/jsonfix"
 authors = ["Ashutosh Kumar <kumarashutosh34169@gmail.com>"]
 keywords = ["json", "repair", "llm", "streaming", "no-std"]
 categories = ["parsing", "no-std", "development-tools"]
-exclude = [
-    ".github/**",
-    "tests/**",
-    "benches/**",
-    "benchmarks/**",
-    "examples/**",
-    "fuzz/**",
-    "clippy.toml",
-    "rustfmt.toml",
-    "Cargo.lock",
-    "CHANGELOG.md",
-]
+# Allowlist of what ships to crates.io: the library source, the manifest,
+# the README (crate page), and the licenses. Tests, examples, benches, fuzz,
+# CI, and tooling config never reach dependents. (Cargo adds its own
+# generated `Cargo.toml.orig`, `.cargo_vcs_info.json`, and `Cargo.lock`.)
+include = ["/src/**/*.rs", "/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [workspace]
 members = ["benchmarks"]
@@ -35,8 +28,11 @@ serde = ["dep:serde"]
 serde_json = ["dep:serde_json", "serde"]
 
 [dependencies]
-serde = { version = "1", default-features = false, features = ["alloc"], optional = true }
-serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
+# Floors are the oldest releases verified to build this crate
+# (`cargo update -Z direct-minimal-versions`): serde_json gained its `alloc`
+# feature in 1.0.45, and older serde releases do not compile against it.
+serde = { version = "1.0.100", default-features = false, features = ["alloc"], optional = true }
+serde_json = { version = "1.0.45", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 proptest = "1"

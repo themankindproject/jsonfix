@@ -1,5 +1,12 @@
 # jsonfix
 
+[![Crates.io](https://img.shields.io/crates/v/jsonfix)](https://crates.io/crates/jsonfix)
+[![Documentation](https://docs.rs/jsonfix/badge.svg)](https://docs.rs/jsonfix)
+[![License](https://img.shields.io/crates/l/jsonfix)](#license)
+[![CI](https://img.shields.io/github/actions/workflow/status/themankindproject/jsonfix/ci.yml?branch=main&label=CI)](https://github.com/themankindproject/jsonfix/actions/workflows/ci.yml)
+![Crates.io Downloads](https://img.shields.io/crates/d/jsonfix)
+![Rust Version](https://img.shields.io/badge/rust-1.85%2B-blue)
+
 `jsonfix` repairs, extracts, and parses the JSON that language models, logs,
 and hand-edited files *almost* produce: trailing commas, `'single quotes'`,
 markdown fences, prose around the document, `None` instead of `null`, or a
