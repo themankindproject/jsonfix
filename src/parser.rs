@@ -24,6 +24,11 @@ use crate::value::{Number, Value, write_escaped};
 /// megabyte even in unoptimized debug builds on small-stack threads.
 pub const MAX_NESTING_DEPTH: usize = 256;
 
+/// Frames pre-reserved on the container stack. Real-world JSON rarely nests
+/// past this, so one upfront allocation covers the common case and skips the
+/// early doublings a `Vec::new()` would pay while descending.
+const FRAME_PREALLOC: usize = 16;
+
 /// A payload-free view of a token, cheap to compare and copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tag {
@@ -223,7 +228,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             lexer: Lexer::new(input, opts),
             peeked: None,
             opts,
-            frames: Vec::new(),
+            frames: Vec::with_capacity(FRAME_PREALLOC),
             max_depth: 0,
             top: TopState::default(),
             out: None,
@@ -245,7 +250,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             lexer: Lexer::new(input, opts),
             peeked: None,
             opts,
-            frames: Vec::new(),
+            frames: Vec::with_capacity(FRAME_PREALLOC),
             max_depth: 0,
             top: TopState::default(),
             out: Some(out),
@@ -1318,24 +1323,27 @@ pub(crate) fn structural_depth(text: &str) -> usize {
     let mut max = 0usize;
     let mut in_str = false;
     let mut esc = false;
-    for c in text.chars() {
+    // Only ASCII structural bytes matter; iterate bytes to skip UTF-8
+    // decoding. Non-ASCII bytes (>= 0x80) only ever appear as string content
+    // or inside tokens, none of which this scan acts on.
+    for &b in text.as_bytes() {
         if in_str {
             if esc {
                 esc = false;
-            } else if c == '\\' {
+            } else if b == b'\\' {
                 esc = true;
-            } else if c == '"' {
+            } else if b == b'"' {
                 in_str = false;
             }
             continue;
         }
-        match c {
-            '"' => in_str = true,
-            '[' | '{' => {
+        match b {
+            b'"' => in_str = true,
+            b'[' | b'{' => {
                 depth += 1;
                 max = max.max(depth);
             }
-            ']' | '}' => depth = depth.saturating_sub(1),
+            b']' | b'}' => depth = depth.saturating_sub(1),
             _ => {}
         }
     }

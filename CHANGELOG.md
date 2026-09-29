@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Nothing has been released yet: everything below ships with `0.1.0`, so it is
 all listed as additions.
 
-## [Unreleased]
+## [0.1.0] - 2026-09-29
 
 ### Added
 
@@ -97,6 +97,9 @@ all listed as additions.
   span itself cannot be repaired.
 - `extract` resumes past a fence's closing ``` instead of re-reading it as an
   opener (an empty fence followed by prose no longer mines the prose).
+- `Value::pointer` array references follow RFC 6901 §4: only `0` or a
+  leading-zero-free digit run indexes an array, so `/01`, `/-1`, and `/1e0`
+  resolve to nothing instead of being coerced through `usize::parse`.
 
 **Performance**
 
@@ -140,6 +143,36 @@ all listed as additions.
   the double-escape pre-pass stops at the first raw quote instead of scanning
   the whole input. Back-to-back A/B on `repair/fenced_body`: ~310–313 μs →
   ~276–279 μs (≈10–12%).
+- `repair_bytes` / `repair_bytes_into` no longer build an intermediate
+  `String` and copy it into the caller's `Vec<u8>`: when the sink's current
+  bytes are valid UTF-8 (always true for an empty sink, i.e. `repair_bytes`)
+  the repair renders straight into the sink's own allocation, moved through a
+  `String` and back with `into_bytes` (no copy). A sink already holding
+  non-UTF-8 bytes keeps the buffered fallback. On the 13 KB LLM-reply fixture
+  this drops `repair_bytes` from 4 allocations / 26.5 KB to 3 / 13.3 KB —
+  byte-for-byte identical to `repair`'s own allocation profile (measured with
+  a counting global allocator).
+- `Value::to_json_string` / `Display` size the output buffer from a cheap
+  one-pass length estimate (`render_len_hint`) instead of starting at 32 bytes
+  and doubling. Rendering the same 13 KB tree drops from 10 allocations /
+  32.7 KB to a single 12.8 KB allocation with no reallocation.
+- `extract` no longer allocates a lowercased copy of each fence's info string
+  to test for the `json` tag; the first four bytes are compared in place with
+  `eq_ignore_ascii_case`. Extracting from a reply with four fences drops from
+  five allocations (one per fence tag plus the candidate list) to one (the
+  candidate list alone), scaling with the number of fences.
+- `Value::pointer` only allocates an unescaped copy of a reference token when
+  it actually contains a `~` escape; ordinary tokens index the tree with the
+  borrowed slice. Resolving `/users/1/name` drops from six allocations (two
+  per segment for the `~1`/`~0` replaces) to zero; escaped tokens keep their
+  single allocation.
+- The parser pre-reserves its container-frame stack (`FRAME_PREALLOC = 16`),
+  so descending into nested input no longer pays the early `Vec` doublings
+  (0→1→2→4→8…); one upfront allocation covers essentially all real-world
+  nesting. Flat input is unaffected (one allocation either way).
+- `structural_depth` (the post-render nesting check) scans bytes instead of
+  `chars()`: every byte it acts on (`"`, `\`, `[`, `{`, `]`, `}`) is ASCII, so
+  UTF-8 decoding was pure overhead on the output-validation pass.
 
 **Tooling**
 

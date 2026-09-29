@@ -149,7 +149,9 @@ impl Value {
 
     /// Resolves an RFC 6901 JSON pointer such as `/choices/0/text`.
     ///
-    /// An empty pointer resolves to `self`.
+    /// An empty pointer resolves to `self`. Array reference tokens follow
+    /// RFC 6901 §4: only `0` or a leading-zero-free run of digits indexes an
+    /// array, so `/01` and `/-1` resolve to nothing.
     #[must_use]
     pub fn pointer(&self, pointer: &str) -> Option<&Value> {
         if pointer.is_empty() {
@@ -157,10 +159,19 @@ impl Value {
         }
         let mut current = self;
         for raw in pointer.split('/').skip(1) {
-            let token = raw.replace("~1", "/").replace("~0", "~");
+            // RFC 6901 escaping is rare; only allocate an unescaped copy when
+            // a `~` is actually present, otherwise index with the borrowed
+            // token directly (no allocation per segment).
+            let unescaped;
+            let token: &str = if raw.contains('~') {
+                unescaped = raw.replace("~1", "/").replace("~0", "~");
+                &unescaped
+            } else {
+                raw
+            };
             current = match current {
-                Value::Object(_) => current.get(&token)?,
-                Value::Array(items) => items.get(token.parse::<usize>().ok()?)?,
+                Value::Object(_) => current.get(token)?,
+                Value::Array(items) => items.get(array_index(token)?)?,
                 _ => return None,
             };
         }
@@ -255,18 +266,61 @@ impl Value {
     /// Renders this value as canonical compact JSON.
     #[must_use]
     pub fn to_json_string(&self) -> String {
-        let mut out = String::with_capacity(32);
+        let mut out = String::with_capacity(self.render_len_hint());
         self.write_to(&mut out);
         out
+    }
+
+    /// A cheap lower-bound estimate of the byte length [`write_to`] produces,
+    /// used to size the output buffer up front and avoid reallocations while
+    /// rendering. Computed in one allocation-free pass; being an estimate, it
+    /// never needs to be exact.
+    fn render_len_hint(&self) -> usize {
+        match self {
+            Value::Null => 4,
+            Value::Bool(true) => 4,
+            Value::Bool(false) => 5,
+            Value::Number(n) => n.as_str().len(),
+            // `+2` for the quotes; escaping may add more, hence "lower bound".
+            Value::String(s) => s.len() + 2,
+            Value::Array(items) => {
+                // `[` + `]` + `, ` between items + each element.
+                2 + items.len().saturating_sub(1) * 2
+                    + items.iter().map(Value::render_len_hint).sum::<usize>()
+            }
+            Value::Object(members) => {
+                // `{` + `}` + `, ` between members + each `"key": value`.
+                2 + members.len().saturating_sub(1) * 2
+                    + members
+                        .iter()
+                        .map(|(key, value)| key.len() + 4 + value.render_len_hint())
+                        .sum::<usize>()
+            }
+        }
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = String::with_capacity(32);
+        let mut out = String::with_capacity(self.render_len_hint());
         self.write_to(&mut out);
         f.write_str(&out)
     }
+}
+
+/// Parses an RFC 6901 array-index reference token.
+///
+/// Per RFC 6901 §4, an array index is either `0` or a sequence of digits with
+/// no leading zero. Tokens such as `01`, `+1`, `-1`, or `1e0` are not valid
+/// array references and resolve to no element.
+fn array_index(token: &str) -> Option<usize> {
+    if token != "0" && token.starts_with('0') {
+        return None;
+    }
+    if !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    token.parse::<usize>().ok()
 }
 
 /// Writes `text` as a JSON string, escaping the minimum the grammar requires.

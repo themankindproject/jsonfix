@@ -302,11 +302,28 @@ pub fn repair_bytes_into(
 ) -> Result<(), Error> {
     let input = str_from_utf8(input)?;
     let start = out.len();
-    let text = repair_with(input, opts).inspect_err(|_| {
-        out.truncate(start);
-    })?;
-    out.extend_from_slice(text.as_bytes());
-    Ok(())
+    // Repair straight into the caller's buffer when its current contents are
+    // valid UTF-8 (always true for an empty sink, i.e. `repair_bytes`): move
+    // the `Vec<u8>` into a `String`, append the canonical JSON, then move it
+    // back with `into_bytes` — the same allocation throughout, so no extra
+    // `String` and no second `extend_from_slice` copy. A sink already holding
+    // non-UTF-8 bytes falls back to the buffered path.
+    match String::from_utf8(core::mem::take(out)) {
+        Ok(mut buf) => {
+            buf.reserve(input.len());
+            let result = repair_into(input, &mut buf, opts);
+            *out = buf.into_bytes();
+            result.inspect_err(|_| out.truncate(start))
+        }
+        Err(error) => {
+            *out = error.into_bytes();
+            let text = repair_with(input, opts).inspect_err(|_| {
+                out.truncate(start);
+            })?;
+            out.extend_from_slice(text.as_bytes());
+            Ok(())
+        }
+    }
 }
 
 /// Validates UTF-8 up front, reporting the first invalid byte's offset —
@@ -445,6 +462,18 @@ mod bytes_tests {
     fn repair_bytes_returns_the_repaired_document() {
         let out = repair_bytes(b"{a: 1}").expect("repairs");
         assert_eq!(out, b"{\"a\": 1}");
+    }
+
+    /// A sink that already holds non-UTF-8 bytes still appends correctly:
+    /// the fast in-place path only applies when the existing contents decode,
+    /// so this exercises the buffered fallback and must preserve the prefix.
+    #[test]
+    fn repair_bytes_into_appends_after_a_non_utf8_prefix() {
+        let mut out: Vec<u8> = alloc::vec![0xFF, 0xFE, b' '];
+        repair_bytes_into(b"{a: 1,}", &mut out, Options::all()).expect("repairs");
+        let mut expected = alloc::vec![0xFF_u8, 0xFE, b' '];
+        expected.extend_from_slice(b"{\"a\": 1}");
+        assert_eq!(out, expected);
     }
 
     /// Invalid UTF-8 fails with the exact byte offset of the first bad byte,

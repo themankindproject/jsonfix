@@ -118,7 +118,12 @@ fn fenced_block(input: &str) -> Option<(usize, usize)> {
             .find('\n')
             .map_or(input.len(), |o| open + o + 1);
         let spec = input[open..line_end].trim();
-        let is_json = spec.to_ascii_lowercase().starts_with("json");
+        // Case-insensitive `json` tag check without allocating a lowercased
+        // copy per fence: compare the first four bytes in place. A non-ASCII
+        // boundary at byte 4 makes `get(..4)` return `None` (not a json tag).
+        let is_json = spec
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("json"));
         let body_start = line_end.min(input.len());
         let body_end = input[body_start..]
             .find("```")
