@@ -149,13 +149,19 @@ impl Value {
 
     /// Resolves an RFC 6901 JSON pointer such as `/choices/0/text`.
     ///
-    /// An empty pointer resolves to `self`. Array reference tokens follow
-    /// RFC 6901 §4: only `0` or a leading-zero-free run of digits indexes an
-    /// array, so `/01` and `/-1` resolve to nothing.
+    /// An empty pointer resolves to `self`; any other pointer must start with
+    /// `/` (so `"users"` resolves to nothing rather than the root). Array
+    /// reference tokens follow RFC 6901 §4: only `0` or a leading-zero-free
+    /// run of digits indexes an array, so `/01` and `/-1` resolve to nothing.
     #[must_use]
     pub fn pointer(&self, pointer: &str) -> Option<&Value> {
         if pointer.is_empty() {
             return Some(self);
+        }
+        // RFC 6901: a non-empty pointer starts with `/`. Without this guard
+        // `pointer("users")` (a likely typo) would yield the root document.
+        if !pointer.starts_with('/') {
+            return None;
         }
         let mut current = self;
         for raw in pointer.split('/').skip(1) {
@@ -176,6 +182,84 @@ impl Value {
             };
         }
         Some(current)
+    }
+
+    /// Mutable elements when this is a [`Value::Array`].
+    #[must_use]
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
+        match self {
+            Value::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Mutable key/value pairs when this is a [`Value::Object`].
+    #[must_use]
+    pub fn as_object_mut(&mut self) -> Option<&mut Vec<(String, Value)>> {
+        match self {
+            Value::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Mutable lookup of a key in an object (first match wins, like [`get`]).
+    ///
+    /// [`get`]: Value::get
+    #[must_use]
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.as_object_mut()?
+            .iter_mut()
+            .find_map(|(k, v)| (k == key).then_some(v))
+    }
+
+    /// Mutable counterpart of [`pointer`](Value::pointer), with the same
+    /// RFC 6901 token rules.
+    ///
+    /// ```
+    /// let mut value = jsonfix::parse("{a: {b: [1, 2]}}").unwrap();
+    /// *value.pointer_mut("/a/b/1").unwrap() = jsonfix::Value::from(20);
+    /// assert_eq!(value.to_json_string(), r#"{"a": {"b": [1, 20]}}"#);
+    /// ```
+    #[must_use]
+    pub fn pointer_mut(&mut self, pointer: &str) -> Option<&mut Value> {
+        if pointer.is_empty() {
+            return Some(self);
+        }
+        if !pointer.starts_with('/') {
+            return None;
+        }
+        let mut current = self;
+        for raw in pointer.split('/').skip(1) {
+            let unescaped;
+            let token: &str = if raw.contains('~') {
+                unescaped = raw.replace("~1", "/").replace("~0", "~");
+                &unescaped
+            } else {
+                raw
+            };
+            current = match current {
+                Value::Object(_) => current.get_mut(token)?,
+                Value::Array(items) => items.get_mut(array_index(token)?)?,
+                _ => return None,
+            };
+        }
+        Some(current)
+    }
+
+    /// Moves the value out, leaving [`Value::Null`] in its place.
+    ///
+    /// Handy for handing a subtree to [`from_value`](crate::from_value)
+    /// without cloning it.
+    ///
+    /// ```
+    /// let mut value = jsonfix::parse("{payload: [1, 2]}").unwrap();
+    /// let payload = value.get_mut("payload").unwrap().take();
+    /// assert_eq!(payload.len(), 2);
+    /// assert!(value["payload"].is_null());
+    /// ```
+    #[must_use]
+    pub fn take(&mut self) -> Value {
+        core::mem::replace(self, Value::Null)
     }
 
     /// Number of elements or members; `0` for scalars.
@@ -305,6 +389,198 @@ impl fmt::Display for Value {
         let mut out = String::with_capacity(self.render_len_hint());
         self.write_to(&mut out);
         f.write_str(&out)
+    }
+}
+
+/// Shared `null` returned by indexing a missing key or index.
+static NULL: Value = Value::Null;
+
+/// `value["key"]`: the member's value, or `null` when `value` is not an
+/// object or has no such key (first match wins, like [`Value::get`]).
+///
+/// Indexing never panics, mirroring `serde_json`'s shared-index behavior, so
+/// lookups chain freely: `value["user"]["name"]`.
+///
+/// ```
+/// let value = jsonfix::parse("{user: {name: 'Ada', tags: ['math']}}").unwrap();
+/// assert_eq!(value["user"]["name"], "Ada");
+/// assert_eq!(value["user"]["tags"][0], "math");
+/// assert!(value["missing"]["deeper"].is_null());
+/// ```
+impl core::ops::Index<&str> for Value {
+    type Output = Value;
+
+    fn index(&self, key: &str) -> &Value {
+        self.get(key).unwrap_or(&NULL)
+    }
+}
+
+/// `value[i]`: the element, or `null` when `value` is not an array or `i` is
+/// out of bounds. Never panics.
+impl core::ops::Index<usize> for Value {
+    type Output = Value;
+
+    fn index(&self, index: usize) -> &Value {
+        self.index(index).unwrap_or(&NULL)
+    }
+}
+
+impl PartialEq<str> for Value {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for Value {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == Some(*other)
+    }
+}
+
+impl PartialEq<String> for Value {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == Some(other.as_str())
+    }
+}
+
+impl PartialEq<Value> for str {
+    fn eq(&self, other: &Value) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<Value> for &str {
+    fn eq(&self, other: &Value) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<Value> for String {
+    fn eq(&self, other: &Value) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<bool> for Value {
+    fn eq(&self, other: &bool) -> bool {
+        self.as_bool() == Some(*other)
+    }
+}
+
+impl PartialEq<Value> for bool {
+    fn eq(&self, other: &Value) -> bool {
+        other == self
+    }
+}
+
+/// Integer comparisons parse the number text exactly (never through `f64`);
+/// every width is implemented so an untyped literal (`value == 36`) resolves.
+macro_rules! eq_integer {
+    ($($ty:ty => $wide:ty, $as_wide:ident);* $(;)?) => {$(
+        impl PartialEq<$ty> for Value {
+            fn eq(&self, other: &$ty) -> bool {
+                self.$as_wide() == Some(<$wide>::from(*other))
+            }
+        }
+
+        impl PartialEq<Value> for $ty {
+            fn eq(&self, other: &Value) -> bool {
+                other == self
+            }
+        }
+    )*};
+}
+
+eq_integer! {
+    i8 => i64, as_i64;
+    i16 => i64, as_i64;
+    i32 => i64, as_i64;
+    i64 => i64, as_i64;
+    u8 => u64, as_u64;
+    u16 => u64, as_u64;
+    u32 => u64, as_u64;
+    u64 => u64, as_u64;
+}
+
+impl PartialEq<isize> for Value {
+    fn eq(&self, other: &isize) -> bool {
+        i64::try_from(*other).is_ok_and(|wide| self.as_i64() == Some(wide))
+    }
+}
+
+impl PartialEq<usize> for Value {
+    fn eq(&self, other: &usize) -> bool {
+        u64::try_from(*other).is_ok_and(|wide| self.as_u64() == Some(wide))
+    }
+}
+
+/// Float comparisons go through [`Value::as_f64`] (the convenience path;
+/// compare [`Number::as_str`] when exactness matters).
+impl PartialEq<f64> for Value {
+    fn eq(&self, other: &f64) -> bool {
+        self.as_f64() == Some(*other)
+    }
+}
+
+impl PartialEq<f32> for Value {
+    fn eq(&self, other: &f32) -> bool {
+        self.as_f64() == Some(f64::from(*other))
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Value::Bool(value)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Value::String(String::from(value))
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Value::String(value)
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    fn from(items: Vec<Value>) -> Self {
+        Value::Array(items)
+    }
+}
+
+impl From<Vec<(String, Value)>> for Value {
+    fn from(members: Vec<(String, Value)>) -> Self {
+        Value::Object(members)
+    }
+}
+
+/// `()` converts to `null`.
+impl From<()> for Value {
+    fn from((): ()) -> Self {
+        Value::Null
+    }
+}
+
+macro_rules! from_integer {
+    ($($ty:ty),* $(,)?) => {$(
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self {
+                Value::Number(Number::from_normalized(alloc::string::ToString::to_string(&value)))
+            }
+        }
+    )*};
+}
+
+from_integer!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+impl<T: Into<Value>> FromIterator<T> for Value {
+    /// Collects into an array.
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Value::Array(iter.into_iter().map(Into::into).collect())
     }
 }
 

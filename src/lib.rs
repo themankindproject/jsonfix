@@ -99,6 +99,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+// docs.rs builds with `--cfg docsrs` (see Cargo.toml metadata): badge every
+// feature-gated item with the feature that enables it.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate alloc;
 
@@ -394,9 +397,13 @@ pub(crate) fn repair_document_into(
             };
             if scan_needed && parser::structural_depth(&out[start..]) > parser::MAX_NESTING_DEPTH {
                 out.truncate(start);
+                // Backstop only (the parser reserves the NDJSON wrap level
+                // itself): the check ran over the whole rendered document, so
+                // report the end of the caller's input rather than an offset
+                // into the output buffer, which means nothing to the caller.
                 return Err(Error::new(
                     crate::ErrorKind::DepthLimitExceeded,
-                    out.len().min(input.len()),
+                    input.len(),
                 ));
             }
             Ok(())

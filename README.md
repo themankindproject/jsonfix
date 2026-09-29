@@ -121,8 +121,12 @@ assert_eq!(
     "1.10"
 );
 
-// Trees: get / index / pointer (RFC 6901) / len.
+// Trees: index / get / pointer (RFC 6901) / len.
 let doc = parse(r#"{"users":[{"name":"ada"},{"name":"bob"}]}"#).unwrap();
+// `[]` never panics: a missing key or index yields `null`, and values
+// compare directly against strings, bools, and integers.
+assert_eq!(doc["users"][1]["name"], "bob");
+assert!(doc["users"][9]["name"].is_null());
 assert_eq!(doc.pointer("/users/1/name").and_then(|v| v.as_str()), Some("bob"));
 assert_eq!(
     doc.get("users").and_then(|u| u.index(0)).and_then(|u| u.get("name")).and_then(|v| v.as_str()),
@@ -339,6 +343,14 @@ assert_eq!(jsonfix::parse(r#"{"a":1,"b":2}"#).unwrap().len(), 2);
 assert_eq!(jsonfix::parse("123456789012345678901234").unwrap().as_number().unwrap().as_i64(), None);
 assert_eq!(jsonfix::parse("1.5").unwrap().as_f64(), Some(1.5));
 
+// Build and edit trees: `From` conversions, `collect`, `get_mut`, `take`.
+let mut reply = jsonfix::parse("{id: 7, tags: ['a']}").unwrap();
+reply.get_mut("tags").and_then(Value::as_array_mut).unwrap().push(Value::from("b"));
+*reply.pointer_mut("/id").unwrap() = Value::from(8);
+assert_eq!(reply.to_json_string(), r#"{"id": 8, "tags": ["a", "b"]}"#);
+let tags = reply.get_mut("tags").unwrap().take(); // moved out, `null` left behind
+assert_eq!(tags, ["a", "b"].into_iter().collect::<Value>());
+
 // Stream state: raw input, repaired output, byte count.
 let mut stream = StreamRepairer::new();
 stream.push(r#"{"a": 1"#).unwrap();
@@ -382,7 +394,7 @@ public; `ErrorKind`, `WriteError`, and `DeserializeError` are
 
 | Type | Shape | Methods / fields |
 |---|---|---|
-| `Value` | `Null`, `Bool`, `Number`, `String`, `Array(Vec<Value>)`, `Object(Vec<(String, Value)>)` | `as_str`, `as_bool`, `as_number`, `as_f64`, `as_i64`, `as_u64`, `as_array`, `as_object`, `get`, `index`, `pointer`, `len`, `is_null`, `is_bool`, `is_number`, `is_string`, `is_array`, `is_object`, `is_empty`, `write_to`, `to_json_string`, `to_serde_json` / `from_serde_json` *(serde_json)* |
+| `Value` | `Null`, `Bool`, `Number`, `String`, `Array(Vec<Value>)`, `Object(Vec<(String, Value)>)` | `as_str`, `as_bool`, `as_number`, `as_f64`, `as_i64`, `as_u64`, `as_array`, `as_object`, `get`, `index`, `pointer`, `as_array_mut`, `as_object_mut`, `get_mut`, `pointer_mut`, `take`, `len`, `is_null`, `is_bool`, `is_number`, `is_string`, `is_array`, `is_object`, `is_empty`, `write_to`, `to_json_string`, `to_serde_json` / `from_serde_json` *(serde_json)*; `v["key"]` / `v[0]` (never panic, `null` when absent); `==` against `str`/`String`/`bool`/integers/floats; `From` bool, strings, integers, `()`, `Vec`s; `FromIterator` |
 | `Number` | the original digit text | `as_str`, `as_f64`, `as_i64`, `as_u64` |
 | `Options` | `allow: Allow`, `repairs: Repairs` | `all`, `strict`, `partial`, `with_repairs`, `with_allow`, `repairs`, `allows` |
 | `Allow` | `NOTHING`/`NONE`, `STR`, `NUM`, `ARR`, `OBJ`, `KEY`, `BOOL`, `NULL`, `ATOM`, `COLLECTION`, `ALL` | `contains`, `is_empty`, `bits`, `union`, `without`, `BitOr` |

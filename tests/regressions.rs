@@ -330,3 +330,86 @@ fn value_predicates_and_u64_accessor_agree_with_variants() {
         assert_eq!(hits, 1, "predicate count for {key}");
     }
 }
+
+// --- cut-off string after `+` (corpus sweep) -----------------------------
+
+#[test]
+fn cut_off_concatenated_segment_follows_the_truncation_policy() {
+    use jsonfix::{Allow, ErrorKind, Options, Repairs};
+    // Truncation repair off: `"a" + "b` errors exactly like a lone `"b`.
+    let no_trunc = Options::all().with_repairs(Repairs::ALL.without(Repairs::TRUNCATION));
+    let error = jsonfix::repair_with("\"a\" + \"b", no_trunc).expect_err("cut-off segment");
+    assert_eq!(error.kind(), &ErrorKind::UnexpectedEnd);
+    assert_eq!(error.position(), 6, "points at the cut-off segment");
+    // A partial policy without `Allow::STR` drops the incomplete value
+    // instead of keeping a half-joined string.
+    let arr_only = Options::partial(Allow::ARR);
+    let value = jsonfix::parse_with("[\"x\" + \"a", arr_only).expect("partial parse");
+    assert_eq!(value.to_json_string(), "[]");
+}
+
+/// Streaming must equal one-shot repair at every prefix, even when a
+/// concatenated segment is still growing (minimized from the fuzz corpus).
+#[test]
+fn streaming_a_cut_off_concatenation_matches_repair() {
+    for doc in [
+        "[[\"\"+\u{201E}]\u{FFFD}",
+        "{\u{FFFD}\r\u{FFFD}''''+''''[''+']'",
+    ] {
+        let mut stream = jsonfix::StreamRepairer::new();
+        let mut accepted = String::new();
+        for ch in doc.chars() {
+            let chunk = ch.to_string();
+            accepted.push_str(&chunk);
+            let got = stream.push(&chunk).map(String::from);
+            let want = jsonfix::repair(&accepted);
+            match (&got, &want) {
+                (Ok(g), Ok(w)) => assert_eq!(g, w, "prefix {accepted:?}"),
+                (Err(_), Err(_)) => accepted.truncate(accepted.len() - chunk.len()),
+                _ => panic!("parity broke at {accepted:?}: {got:?} vs {want:?}"),
+            }
+        }
+    }
+}
+
+// --- NDJSON wrap depth accounting ----------------------------------------
+
+fn nested(depth: usize) -> String {
+    format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+#[test]
+fn depth_errors_agree_between_repair_and_parse() {
+    for doc in [
+        format!("1\n{}", nested(256)),
+        format!("{}\n1", nested(256)),
+        nested(257),
+    ] {
+        let repaired = jsonfix::repair(&doc).expect_err("too deep once wrapped");
+        let parsed = jsonfix::parse(&doc).expect_err("too deep once wrapped");
+        assert_eq!(repaired.kind(), &jsonfix::ErrorKind::DepthLimitExceeded);
+        assert_eq!(
+            repaired,
+            parsed,
+            "same error, same byte, for {} bytes",
+            doc.len()
+        );
+    }
+    // A later value deeper than the wrap allows fails at its offending
+    // opener, not at the start or end of the document.
+    let error = jsonfix::repair(&format!("1\n{}", nested(256))).unwrap_err();
+    assert_eq!(error.position(), 2 + 255);
+    // One level less fits exactly (wrap + 255 = 256) and validates.
+    let ok = jsonfix::repair(&format!("1\n{}", nested(255))).expect("fits");
+    assert!(jsonfix::validate(&ok).is_ok());
+}
+
+#[test]
+fn repair_into_ignores_brackets_already_in_the_callers_buffer() {
+    // The depth check must measure this document only; text the caller
+    // already put in the buffer is not part of it.
+    let mut out = "[".repeat(300);
+    jsonfix::repair_into("1\n2", &mut out, jsonfix::Options::all()).expect("repairs");
+    assert!(out.ends_with("[1, 2]"));
+    assert_eq!(out.len(), 300 + "[1, 2]".len());
+}

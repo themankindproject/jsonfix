@@ -25,6 +25,17 @@ all listed as additions.
   exhaustive `match` over it is stable.
 - `Value` accessors and predicates: `as_u64` joins `as_i64`/`as_f64`, and
   `is_bool`/`is_number`/`is_string`/`is_array`/`is_object` join `is_null`.
+- Ergonomic `Value` access in the `serde_json` style: `value["key"]` and
+  `value[i]` via `Index` (never panic — a missing key, out-of-range index,
+  or wrong kind yields a shared `null`, so lookups chain freely);
+  `PartialEq` against `str`/`String`/`bool`/every integer width (exact, via
+  the number text) and floats, in both directions (`value["n"] == 36`);
+  `From` for `bool`, `&str`/`String`, every integer width, `()` (`null`),
+  `Vec<Value>`, and `Vec<(String, Value)>`, plus `FromIterator` for arrays.
+- Mutable access: `get_mut`, `pointer_mut`, `as_array_mut`, `as_object_mut`,
+  and `take` (move a subtree out, e.g. into `from_value`, without cloning).
+- docs.rs badges every feature-gated item with the feature that enables it
+  (`doc_cfg` under `--cfg docsrs`).
 - `Repairs` bitmask (12 passes) and `Allow` bitmask (partial-json semantics).
 - Byte-precise `Error`/`ErrorKind` with `Display` messages and stable
   `message()` text.
@@ -49,8 +60,11 @@ all listed as additions.
 - `from_value` (feature `serde`): read a repaired `Value` into any serde data
   model without an intermediate `String` and without `serde_json`. Integer
   targets parse the number text exactly (`1234567890123456789` into `u64`
-  never detours through `f64`), float targets reject non-finite text, and text
-  that does not fit the target errors instead of being silently narrowed.
+  never detours through `f64`), float targets reject any value that is not
+  finite in the *target* type — including one that overflows `f32` to infinity
+  while still finite as `f64` (`1e40` into an `f32` field errors rather than
+  yielding `inf`) — and text that does not fit the target errors instead of
+  being silently narrowed.
 - `loads` / `loads_with` (feature `serde_json`): one call from broken text to a
   `serde_json::Value`, rendering through `Value::to_serde_json` so numbers
   outside the finite `f64` range survive as strings instead of erroring the
@@ -100,6 +114,23 @@ all listed as additions.
 - `Value::pointer` array references follow RFC 6901 §4: only `0` or a
   leading-zero-free digit run indexes an array, so `/01`, `/-1`, and `/1e0`
   resolve to nothing instead of being coerced through `usize::parse`.
+- `Value::pointer` rejects a non-empty pointer that does not start with `/`
+  (RFC 6901): `pointer("users")` resolves to nothing instead of silently
+  returning the whole document.
+- A cut-off string segment after `+` (`"a" + "b`) follows the same policy as
+  a lone cut-off string: it errors without `TRUNCATION`, drops the value
+  without `Allow::STR`, and blocks stream checkpoints. Previously the joined
+  string was accepted unconditionally, and a checkpoint after it let
+  `StreamRepairer` diverge from `repair` once the segment kept growing
+  (found by replaying the fuzz corpus through a prefix-parity sweep: 74
+  prefix divergences and 64 `push_delta` mismatches, now zero).
+- The NDJSON `[` wrap's extra nesting level is reserved when entering a
+  container, so an over-deep later value fails at its offending opener with
+  the same byte offset from `repair`, `parse`, and `StreamRepairer`
+  (previously `repair` reported byte 0 from a post-render scan while `parse`
+  reported the end of input). The wrap check also measures only the current
+  document's output, so `repair_into` no longer fails with
+  `DepthLimitExceeded` when the caller's buffer already holds `[` characters.
 
 **Performance**
 

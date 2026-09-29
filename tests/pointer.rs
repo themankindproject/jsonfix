@@ -50,3 +50,23 @@ fn bare_slash_repairs_to_a_string_not_data() {
     // behavior for slash-led input.
     assert_eq!(repair("/abc").unwrap(), "\"/abc\"");
 }
+
+#[test]
+fn non_empty_pointer_without_leading_slash_resolves_to_nothing() {
+    // RFC 6901: a non-empty pointer starts with `/`. A missing slash is a
+    // likely typo and must not silently return the whole document.
+    let value = parse("{\"users\": [1, 2]}").expect("parses");
+    assert_eq!(value.pointer("users"), None);
+    assert_eq!(value.pointer("users/0"), None);
+    assert!(value.pointer("/users").is_some());
+}
+
+#[test]
+fn pointer_mut_follows_the_same_rules() {
+    let mut value = parse("{\"a/b\": [1, 2], \"k\": 0}").expect("parses");
+    *value.pointer_mut("/a~1b/1").expect("resolves") = jsonfix::Value::from(9);
+    assert_eq!(value.to_json_string(), "{\"a/b\": [1, 9], \"k\": 0}");
+    assert!(value.pointer_mut("/a~1b/01").is_none());
+    assert!(value.pointer_mut("k").is_none());
+    assert!(value.pointer_mut("").is_some());
+}

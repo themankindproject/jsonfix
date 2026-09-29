@@ -179,11 +179,41 @@ pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, serde::de::val
     T::deserialize(value)
 }
 
-/// Typed integer/float targets: the number *text* must parse as that type,
-/// so `1234567890123456789` reads into `u64` exactly and text that does not
-/// fit errors instead of being narrowed through a cast. Float targets and
-/// float-valued text additionally reject non-finite values (e.g. `1e400`).
-macro_rules! parse_number_method {
+/// Typed integer targets: the number *text* must parse as that type, so
+/// `1234567890123456789` reads into `u64` exactly and text that does not fit
+/// errors instead of being narrowed through a cast. (Float targets have their
+/// own macro below, which additionally rejects non-finite values.)
+macro_rules! parse_int_method {
+    ($method:ident, $visit:ident, $ty:ty) => {
+        fn $method<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                Value::Number(text) => {
+                    let raw = text.as_str();
+                    // Integer text either fits the target exactly or errors;
+                    // a successful parse is always a finite, representable
+                    // value, so no finiteness check is needed here.
+                    match raw.parse::<$ty>() {
+                        Ok(value) => visitor.$visit(value),
+                        Err(_) => Err(DeError::custom(alloc::format!(
+                            "number `{raw}` does not fit `{}`",
+                            core::stringify!($ty)
+                        ))),
+                    }
+                }
+                other => Err(type_error(core::stringify!($ty), other)),
+            }
+        }
+    };
+}
+
+/// Typed float targets: the number *text* must parse as that type and be
+/// finite in it — a value that overflows the target to ±infinity (e.g. `1e40`
+/// into `f32`, or `1e400` into `f64`) is rejected rather than silently
+/// yielding `inf`.
+macro_rules! parse_float_method {
     ($method:ident, $visit:ident, $ty:ty) => {
         fn $method<V>(self, visitor: V) -> Result<V::Value, Self::Error>
         where
@@ -193,12 +223,15 @@ macro_rules! parse_number_method {
                 Value::Number(text) => {
                     let raw = text.as_str();
                     match raw.parse::<$ty>() {
-                        Ok(value) => match raw.parse::<f64>() {
-                            Ok(f) if !f.is_finite() => Err(DeError::custom(alloc::format!(
-                                "number `{raw}` is not a finite float and cannot be represented"
-                            ))),
-                            _ => visitor.$visit(value),
-                        },
+                        // Rust's float parse saturates out-of-range input to
+                        // ±inf rather than erroring, so check the *target
+                        // type's* own finiteness — an f64 re-parse would miss
+                        // a value that overflows f32 but is finite in f64
+                        // (e.g. `1e40` into `f32`).
+                        Ok(value) if value.is_finite() => visitor.$visit(value),
+                        Ok(_) => Err(DeError::custom(alloc::format!(
+                            "number `{raw}` is not a finite float and cannot be represented"
+                        ))),
                         Err(_) => Err(DeError::custom(alloc::format!(
                             "number `{raw}` does not fit `{}`",
                             core::stringify!($ty)
@@ -240,16 +273,16 @@ impl<'de> Deserializer<'de> for Value {
         }
     }
 
-    parse_number_method!(deserialize_i8, visit_i8, i8);
-    parse_number_method!(deserialize_i16, visit_i16, i16);
-    parse_number_method!(deserialize_i32, visit_i32, i32);
-    parse_number_method!(deserialize_i64, visit_i64, i64);
-    parse_number_method!(deserialize_u8, visit_u8, u8);
-    parse_number_method!(deserialize_u16, visit_u16, u16);
-    parse_number_method!(deserialize_u32, visit_u32, u32);
-    parse_number_method!(deserialize_u64, visit_u64, u64);
-    parse_number_method!(deserialize_f32, visit_f32, f32);
-    parse_number_method!(deserialize_f64, visit_f64, f64);
+    parse_int_method!(deserialize_i8, visit_i8, i8);
+    parse_int_method!(deserialize_i16, visit_i16, i16);
+    parse_int_method!(deserialize_i32, visit_i32, i32);
+    parse_int_method!(deserialize_i64, visit_i64, i64);
+    parse_int_method!(deserialize_u8, visit_u8, u8);
+    parse_int_method!(deserialize_u16, visit_u16, u16);
+    parse_int_method!(deserialize_u32, visit_u32, u32);
+    parse_int_method!(deserialize_u64, visit_u64, u64);
+    parse_float_method!(deserialize_f32, visit_f32, f32);
+    parse_float_method!(deserialize_f64, visit_f64, f64);
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
@@ -694,6 +727,22 @@ mod from_value_tests {
         let value = crate::parse("1e400").expect("repairs");
         let error = from_value::<f64>(value).expect_err("non-finite");
         assert!(alloc::format!("{error}").contains("finite"));
+    }
+
+    /// A value that is finite as `f64` but overflows `f32` to infinity must
+    /// still be rejected for an `f32` target: the finiteness check is against
+    /// the target type, not `f64`. (`1e40` parses to `f32::INFINITY`.)
+    #[test]
+    fn from_value_rejects_f32_overflow_to_infinity() {
+        let value = crate::parse("1e40").expect("repairs");
+        let error = from_value::<f32>(value).expect_err("overflows f32 to inf");
+        assert!(alloc::format!("{error}").contains("finite"));
+        // A value comfortably inside f32 range still deserializes.
+        let value = crate::parse("3.5").expect("repairs");
+        assert_eq!(from_value::<f32>(value).expect("in range"), 3.5_f32);
+        // The same text is finite as f64 and must still be accepted there.
+        let value = crate::parse("1e40").expect("repairs");
+        assert!(from_value::<f64>(value).is_ok());
     }
 
     /// An integer that does not fit the target width errors instead of

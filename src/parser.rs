@@ -379,8 +379,16 @@ impl<'a, 'b> Parser<'a, 'b> {
     }
 
     /// Enters one container; fails once [`MAX_NESTING_DEPTH`] is reached.
+    ///
+    /// Once a top-level value has completed, any later top-level value is
+    /// being wrapped into the NDJSON `[...]` array, which renders one extra
+    /// level `frames` never holds. That level is reserved here so the error
+    /// fires at the offending opener — the same byte in tree and stream mode —
+    /// instead of surfacing later from a post-render scan with no useful
+    /// position.
     fn enter(&mut self, kind: ContainerKind) -> Result<(), Error> {
-        if self.frames.len() >= MAX_NESTING_DEPTH {
+        let wrap_level = usize::from(self.top.count >= 1);
+        if self.frames.len() + wrap_level >= MAX_NESTING_DEPTH {
             return Err(Error::new(ErrorKind::DepthLimitExceeded, self.position()));
         }
         self.frames.push(Frame {
@@ -579,14 +587,19 @@ impl<'a, 'b> Parser<'a, 'b> {
             // valid JSON. `insert` shifts the buffer, so rollback is explicit
             // rather than a truncate to a pre-insert length.
             let base = self.emit().map(|out| out.len());
-            let inserted_bracket = self.emit().is_some() && values.len() == 1;
-            if inserted_bracket {
+            let wraps_first = values.len() == 1;
+            let inserted_bracket = self.emit().is_some() && wraps_first;
+            if wraps_first {
                 // The wrap adds one nesting level that `enter()` never counted
-                // (the first value already used the full depth budget).
-                if let Some(out) = self.emit() {
-                    if structural_depth(out) >= MAX_NESTING_DEPTH {
-                        return Err(Error::new(ErrorKind::DepthLimitExceeded, self.position()));
-                    }
+                // for the first value (it may already use the full budget).
+                // Measure only this document's rendering (`first_pos..`): the
+                // buffer may hold caller-provided text before it.
+                let first_depth = match self.emit() {
+                    Some(out) => structural_depth(&out[first_pos..]),
+                    None => value_depth(&values[0]),
+                };
+                if first_depth >= MAX_NESTING_DEPTH {
+                    return Err(Error::new(ErrorKind::DepthLimitExceeded, self.position()));
                 }
             }
             if let Some(out) = self.emit() {
@@ -831,8 +844,26 @@ impl Parser<'_, '_> {
             }
             self.take();
             match self.peek_tag(false)? {
-                Some(Tag::Str { .. }) => {
-                    if let Token::Str { text: next, .. } = self.take().token {
+                Some(Tag::Str {
+                    truncated: segment_truncated,
+                }) => {
+                    let spanned = self.take();
+                    let segment_start = spanned.start;
+                    if let Token::Str { text: next, .. } = spanned.token {
+                        // A cut-off segment after `+` is a cut-off string and
+                        // follows the same policy as a lone one: an error
+                        // without TRUNCATION, the whole (incomplete) value
+                        // dropped without `Allow::STR`, and no stable stream
+                        // checkpoint after it.
+                        if segment_truncated {
+                            if !self.opts.repairs(Repairs::TRUNCATION) {
+                                return Err(Error::new(ErrorKind::UnexpectedEnd, segment_start));
+                            }
+                            if !self.opts.allows(Allow::STR) {
+                                return Ok(None);
+                            }
+                            self.eof_dependent = true;
+                        }
                         text.to_mut().push_str(&next);
                     }
                 }
