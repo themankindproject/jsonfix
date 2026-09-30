@@ -21,7 +21,7 @@ numbers. Modeled on the excellent JavaScript
 
 ```toml
 [dependencies]
-jsonfix = "0.1"
+jsonfix = "0.2"
 ```
 
 | Feature | Adds | Default |
