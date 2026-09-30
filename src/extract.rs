@@ -75,11 +75,21 @@ pub fn extract_partial(input: &str) -> &str {
 pub fn extract_all(input: &str) -> Vec<&str> {
     let mut values = Vec::new();
     let mut pos = 0usize;
+    // The first `{`/`[` at or after `pos`, cached across iterations: a
+    // stretch with no bracket is searched once, not once per value in it
+    // (prose full of bare scalars would otherwise rescan to the end each time).
+    let mut bracket = first_bracket(input);
     while pos < input.len() {
-        let Some(offset) = first_value_start(&input[pos..]) else {
-            break;
+        if bracket.is_some_and(|at| at < pos) {
+            bracket = first_bracket(&input[pos..]).map(|at| pos + at);
+        }
+        let start = match bracket {
+            Some(at) => at,
+            None => match first_scalar_start(&input[pos..]) {
+                Some(offset) => pos + offset,
+                None => break,
+            },
         };
-        let start = pos + offset;
         let Some((_, end)) = scan_value(input, start, false) else {
             break;
         };
@@ -94,23 +104,29 @@ pub fn extract_all(input: &str) -> Vec<&str> {
 /// Structural values (`{`, `[`) are preferred; a bare scalar is only used when
 /// there is nothing better in the input.
 fn first_value_start(input: &str) -> Option<usize> {
-    let mut fallback = None;
+    first_bracket(input).or_else(|| first_scalar_start(input))
+}
+
+/// The byte offset of the first `{` or `[`.
+fn first_bracket(input: &str) -> Option<usize> {
+    input.bytes().position(|b| b == b'{' || b == b'[')
+}
+
+/// The byte offset of the first character that can start a bare scalar.
+fn first_scalar_start(input: &str) -> Option<usize> {
     let mut chars = input.char_indices().peekable();
     while let Some((offset, c)) = chars.next() {
-        if c == '{' || c == '[' {
+        let next = chars.peek().map(|&(_, next)| next);
+        if is_value_start(c, next) {
             return Some(offset);
         }
-        let next = chars.peek().copied().map(|(_, next)| next);
-        if fallback.is_none() && is_value_start(c, next) {
-            fallback = Some(offset);
-        }
     }
-    fallback
+    None
 }
 
 /// Finds the first non-empty fenced code block, preferring one tagged `json`.
 fn fenced_block(input: &str) -> Option<(usize, usize)> {
-    let mut candidates: Vec<(bool, usize, usize)> = Vec::new();
+    let mut first = None;
     let mut search = 0usize;
     while let Some(offset) = input[search..].find("```") {
         let open = search + offset + 3;
@@ -129,7 +145,10 @@ fn fenced_block(input: &str) -> Option<(usize, usize)> {
             .find("```")
             .map_or(input.len(), |o| body_start + o);
         if body_end > body_start && !input[body_start..body_end].trim().is_empty() {
-            candidates.push((is_json, body_start, body_end));
+            if is_json {
+                return Some((body_start, body_end));
+            }
+            first.get_or_insert((body_start, body_end));
         }
         if body_end <= search {
             break;
@@ -139,11 +158,7 @@ fn fenced_block(input: &str) -> Option<(usize, usize)> {
         // fences as a fake candidate body.
         search = body_end.saturating_add(3).min(input.len());
     }
-    let chosen = candidates
-        .iter()
-        .find(|(is_json, _, _)| *is_json)
-        .or_else(|| candidates.first())?;
-    Some((chosen.1, chosen.2))
+    first
 }
 
 /// Scans the value starting at `start`, returning its `[start, end)` span.
@@ -167,38 +182,65 @@ fn scan_value(input: &str, start: usize, partial: bool) -> Option<(usize, usize)
 }
 
 /// Bracket-matching scan that is aware of strings and comments.
+///
+/// Byte-wise: every structural byte is ASCII, so only non-ASCII bytes (which
+/// may be typographic quotes) are decoded.
 fn scan_container(input: &str, start: usize, partial: bool) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut chars = input[start..].char_indices().peekable();
-    while let Some((offset, c)) = chars.next() {
+    let mut i = start;
+    while i < bytes.len() {
         if let Some(open) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if closes(open, c) {
+            if open == '"' || open == '\'' {
+                // Only the quote itself and `\` matter inside a string opened
+                // by an ASCII quote: skip everything else in bulk.
+                i = crate::swar::find_either(bytes, i, open as u8, b'\\');
+                if i == bytes.len() {
+                    break;
+                }
+            }
+            let c = char_at(input, i);
+            let next = i + c.len_utf8();
+            if c == '\\' && next < bytes.len() {
+                // Skip the escaped character, whatever its width.
+                i = next + char_at(input, next).len_utf8();
+                continue;
+            }
+            if closes(open, c) {
                 quote = None;
             }
+            i = next;
             continue;
         }
+        let c = char_at(input, i);
+        let next = i + c.len_utf8();
         match c {
             c if is_double_quote(c) || is_single_quote(c) => quote = Some(c),
-            '/' if matches!(chars.peek(), Some((_, '/' | '*'))) => {
-                skip_comment(input, start + offset, &mut chars);
+            '/' if matches!(bytes.get(next), Some(b'/' | b'*')) => {
+                i = comment_end(input, i);
+                continue;
             }
             '{' | '[' => depth += 1,
             '}' | ']' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some((start, start + offset + c.len_utf8()));
+                    return Some((start, next));
                 }
             }
             _ => {}
         }
+        i = next;
     }
     partial.then_some((start, input.len()))
+}
+
+/// The character starting at byte `i` (a char boundary before the end).
+fn char_at(input: &str, i: usize) -> char {
+    match input.as_bytes()[i] {
+        byte if byte.is_ascii() => char::from(byte),
+        _ => input[i..].chars().next().unwrap_or('\0'),
+    }
 }
 
 /// Scans a quoted string, returning the offset just past its closing quote.
@@ -233,25 +275,15 @@ fn closes(open: char, c: char) -> bool {
     }
 }
 
-/// Skips a `//` or `/* */` comment while scanning.
-fn skip_comment(
-    input: &str,
-    at: usize,
-    chars: &mut core::iter::Peekable<core::str::CharIndices<'_>>,
-) {
-    if input[at..].starts_with("//") {
-        for (_, c) in chars.by_ref() {
-            if c == '\n' {
-                break;
-            }
-        }
+/// End of the `//` or `/* */` comment starting at byte `at`: just past the
+/// line's newline or the closing `*/`, or the end of input when unterminated.
+fn comment_end(input: &str, at: usize) -> usize {
+    let closer = if input[at..].starts_with("//") {
+        "\n"
     } else {
-        chars.next();
-        while let Some((_, c)) = chars.next() {
-            if c == '*' && chars.peek().is_some_and(|(_, next)| *next == '/') {
-                chars.next();
-                break;
-            }
-        }
-    }
+        "*/"
+    };
+    input[at + 2..]
+        .find(closer)
+        .map_or(input.len(), |end| at + 2 + end + closer.len())
 }

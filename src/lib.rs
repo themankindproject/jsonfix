@@ -168,21 +168,30 @@ pub fn parse(input: &str) -> Result<Value, Error> {
 ///
 /// Returns an [`Error`] if `input` cannot be repaired under `opts`.
 pub fn parse_with(input: &str, opts: Options) -> Result<Value, Error> {
-    // A whole document that was escaped once too often, such as `{\"a\": 1}`.
-    if opts.repairs(Repairs::UNQUOTED) && looks_double_escaped(input) {
-        let unescaped = unescape_once(input);
-        return parser::Parser::new(&unescaped, opts)
-            .parse_document()
-            // The parser saw the rewritten copy; report positions in the
-            // bytes the caller actually passed in.
-            .map_err(|error| {
-                Error::new(
-                    error.kind().clone(),
-                    unescaped_position(input, error.position()),
-                )
-            });
+    unescaped(input, opts, |text, _| {
+        parser::Parser::new(text, opts).parse_document()
+    })
+}
+
+/// Runs `parse` over the text the parser should see: `input` itself, or its
+/// once-unescaped copy when the whole document lost one escaping layer
+/// (`{\"a\": 1}`, flagged by `parse`'s second argument). Error positions are
+/// reported in the caller's bytes either way.
+fn unescaped<T>(
+    input: &str,
+    opts: Options,
+    parse: impl FnOnce(&str, bool) -> Result<T, Error>,
+) -> Result<T, Error> {
+    if !(opts.repairs(Repairs::UNQUOTED) && looks_double_escaped(input)) {
+        return parse(input, false);
     }
-    parser::Parser::new(input, opts).parse_document()
+    let text = unescape_once(input);
+    parse(&text, true).map_err(|error| {
+        Error::new(
+            error.kind().clone(),
+            unescaped_position(input, error.position()),
+        )
+    })
 }
 
 /// Like [`parse_with`], named for the partial-parsing use case.
@@ -354,70 +363,42 @@ pub(crate) fn repair_document_into(
     cp: Option<&mut parser::ResumeCp>,
 ) -> Result<(), Error> {
     let start = out.len();
-    // Set on the stream path: the parser's high-water nesting, used to skip
-    // the post-render depth scan when the output provably fits.
-    let mut max_depth: Option<usize> = None;
-    // Set when the double-escape pre-pass rewrote the input, so error
-    // positions can be mapped back to the caller's bytes.
-    let mut double_escaped = false;
+    // `Some(depth)` on the stream path: the parser's high-water nesting, used
+    // to skip the post-render depth scan when the output provably fits.
     let result = if opts.allows(Allow::ALL) {
-        // A whole document that was escaped once too often, such as `{\"a\": 1}`.
-        double_escaped = opts.repairs(Repairs::UNQUOTED) && looks_double_escaped(input);
-        let unescaped;
-        let effective: &str = if double_escaped {
-            unescaped = unescape_once(input);
-            &unescaped
-        } else {
-            input
-        };
-        // Checkpoints index the raw input; the unescape pre-pass would
-        // invalidate their offsets, so they are disabled for that path.
-        let cp = if double_escaped { None } else { cp };
-        let mut parser = parser::Parser::new_stream(effective, opts, out, cp);
-        let result = parser.parse_document_stream();
-        max_depth = Some(parser.max_depth());
-        result
+        unescaped(input, opts, |text, rewritten| {
+            // Checkpoints index the raw input; the unescape pre-pass would
+            // invalidate their offsets, so they are disabled for that path.
+            let cp = if rewritten { None } else { cp };
+            let mut parser = parser::Parser::new_stream(text, opts, out, cp);
+            parser.parse_document_stream()?;
+            Ok(Some(parser.max_depth()))
+        })
     } else {
-        parse_with(input, opts).map(|value| value.write_to(out))
+        parse_with(input, opts).map(|value| {
+            value.write_to(out);
+            None
+        })
     };
-    match result {
-        Ok(()) => {
-            // Post-condition: anything we emit must survive `validate`,
-            // including its `MAX_NESTING_DEPTH` check (the NDJSON wrap can
-            // add a level `enter()` never counted — also guard here so no
-            // path can skip the explicit checks). `max_depth` (stream path)
-            // upper-bounds the rendered structural depth, so the scan is
-            // skipped unless even that bound cannot rule the output in:
-            // reserving one level for a possible NDJSON `[` wrap keeps the
-            // skip sound (a group frame that emitted no bracket only makes
-            // the bound more conservative).
-            let scan_needed = match max_depth {
-                Some(depth) => depth + 1 > parser::MAX_NESTING_DEPTH,
-                None => true,
-            };
-            if scan_needed && parser::structural_depth(&out[start..]) > parser::MAX_NESTING_DEPTH {
-                out.truncate(start);
-                // Backstop only (the parser reserves the NDJSON wrap level
-                // itself): the check ran over the whole rendered document, so
-                // report the end of the caller's input rather than an offset
-                // into the output buffer, which means nothing to the caller.
-                return Err(Error::new(
-                    crate::ErrorKind::DepthLimitExceeded,
-                    input.len(),
-                ));
-            }
-            Ok(())
-        }
-        Err(error) => {
-            out.truncate(start);
-            let position = if double_escaped {
-                unescaped_position(input, error.position())
-            } else {
-                error.position()
-            };
-            Err(Error::new(error.kind().clone(), position))
-        }
+    let max_depth = result.inspect_err(|_| out.truncate(start))?;
+    // Post-condition: anything we emit must survive `validate`, including
+    // its `MAX_NESTING_DEPTH` check (the NDJSON wrap can add a level
+    // `enter()` never counted — also guard here so no path can skip the
+    // explicit checks). `max_depth` (stream path) upper-bounds the rendered
+    // structural depth, so the scan is skipped unless even that bound cannot
+    // rule the output in: reserving one level for a possible NDJSON `[` wrap
+    // keeps the skip sound (a group frame that emitted no bracket only makes
+    // the bound more conservative).
+    let scan_needed = max_depth.is_none_or(|depth| depth + 1 > parser::MAX_NESTING_DEPTH);
+    if scan_needed && parser::structural_depth(&out[start..]) > parser::MAX_NESTING_DEPTH {
+        out.truncate(start);
+        // Backstop only (the parser reserves the NDJSON wrap level itself):
+        // the check ran over the whole rendered document, so report the end
+        // of the caller's input rather than an offset into the output
+        // buffer, which means nothing to the caller.
+        return Err(Error::new(ErrorKind::DepthLimitExceeded, input.len()));
     }
+    Ok(())
 }
 
 #[cfg(feature = "std")]
@@ -749,21 +730,16 @@ fn unescape_once(input: &str) -> String {
             out.push(c);
             continue;
         }
+        // One-character escapes decode; anything else (`\u`, unknown
+        // escapes, a trailing `\`) keeps its backslash for the parser.
         match chars.next() {
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('/') => out.push('/'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('b') => out.push('\u{08}'),
-            Some('f') => out.push('\u{0C}'),
-            Some('u') => out.push_str("\\u"),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
+            Some(next) => match chars::simple_escape(next) {
+                Some(decoded) => out.push(decoded),
+                None => {
+                    out.push('\\');
+                    out.push(next);
+                }
+            },
             None => out.push('\\'),
         }
     }
@@ -787,7 +763,7 @@ fn unescaped_position(input: &str, position: usize) -> usize {
             match chars.peek() {
                 Some(&(_, next)) => {
                     chars.next();
-                    if matches!(next, '"' | '\\' | '\'' | '/' | 'n' | 'r' | 't' | 'b' | 'f') {
+                    if chars::simple_escape(next).is_some() {
                         (2, 1)
                     } else {
                         let len = 1 + next.len_utf8();

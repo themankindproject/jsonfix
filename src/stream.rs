@@ -119,54 +119,8 @@ impl StreamRepairer {
     ///
     /// Returns an [`Error`] if the accumulated input cannot be repaired.
     pub fn push(&mut self, chunk: &str) -> Result<&str, Error> {
-        let before = self.input.len();
-        self.note_chunk(chunk);
-        self.input.push_str(chunk);
-        if self.can_resume() {
-            // Keep the stable prefix, drop the old tail, parse only the rest.
-            let keep = self.cp.output_len.min(self.current.len());
-            self.current.truncate(keep);
-            let resumed = {
-                let mut parser = parser::Parser::new_stream_resumed(
-                    &self.input,
-                    self.opts,
-                    &mut self.current,
-                    &mut self.cp,
-                );
-                parser.parse_resume()
-            };
-            if resumed.is_ok() {
-                return Ok(&self.current);
-            }
-            // Fall through to a full render with the (possibly extended) cp.
-        }
-        self.current.clear();
-        let result = if self.cp_enabled() {
-            crate::repair_document_into(
-                &self.input,
-                self.opts,
-                &mut self.current,
-                Some(&mut self.cp),
-            )
-        } else {
-            crate::repair_document_into(&self.input, self.opts, &mut self.current, None)
-        };
-        match result {
-            Ok(()) => Ok(&self.current),
-            Err(error) => {
-                // The failed parse may have recorded checkpoints past
-                // `before` (or mid-tail); they must not be resumed after
-                // the rollback.
-                self.cp.valid = false;
-                self.escape_scan.rollback();
-                self.input.truncate(before);
-                self.current.clear();
-                // Restore the last successful rendering of the rolled-back input.
-                let _ =
-                    crate::repair_document_into(&self.input, self.opts, &mut self.current, None);
-                Err(error)
-            }
-        }
+        self.render(chunk, false)?;
+        Ok(&self.current)
     }
 
     /// Appends `chunk` and returns only the changed tail.
@@ -180,73 +134,91 @@ impl StreamRepairer {
     ///
     /// [`push`]: Self::push
     pub fn push_delta(&mut self, chunk: &str) -> Result<Delta<'_>, Error> {
+        let keep = self.render(chunk, true)?;
+        Ok(Delta {
+            keep,
+            text: &self.current[keep..],
+        })
+    }
+
+    /// Appends `chunk` and re-renders `current`, resuming from the last stable
+    /// checkpoint when possible. With `delta`, returns the length of the
+    /// longest char-aligned prefix the new output shares with the previous one.
+    ///
+    /// Invariant: `cp.valid` implies `cp` was recorded by the render (or the
+    /// resumes continuing it) that produced `current`.
+    fn render(&mut self, chunk: &str, delta: bool) -> Result<usize, Error> {
         let before = self.input.len();
         self.note_chunk(chunk);
         self.input.push_str(chunk);
         if self.can_resume() {
-            // `previous` ← last output (diff base); `current` ← stable
-            // prefix (copied out of it) + the resumed tail.
-            core::mem::swap(&mut self.previous, &mut self.current);
-            self.current.clear();
-            let prefix_len = self.cp.output_len.min(self.previous.len());
-            self.current.push_str(&self.previous[..prefix_len]);
-            let resumed = {
-                let mut parser = parser::Parser::new_stream_resumed(
-                    &self.input,
-                    self.opts,
-                    &mut self.current,
-                    &mut self.cp,
-                );
-                parser.parse_resume()
-            };
-            match resumed {
-                Ok(()) => {
-                    let keep = common_prefix_len(&self.previous, &self.current);
-                    return Ok(Delta {
-                        keep,
-                        text: &self.current[keep..],
-                    });
-                }
-                Err(error) => {
-                    // Roll back: `previous` currently holds the last good
-                    // output; swap it back into `current`.
-                    self.cp.valid = false;
-                    self.escape_scan.rollback();
-                    self.current.clear();
-                    core::mem::swap(&mut self.previous, &mut self.current);
-                    self.input.truncate(before);
-                    return Err(error);
-                }
+            let keep = self.cp.output_len.min(self.current.len());
+            if delta {
+                // The diff base past the stable prefix (the prefix is shared).
+                self.previous.clear();
+                self.previous.push_str(&self.current[keep..]);
             }
-        }
-        // Full path: render the new output into `previous` (whose old content
-        // is a stale diff base), then swap so `previous` becomes the last
-        // output and `current` the new one. On error only `input` rolls back.
-        self.previous.clear();
-        let result = if self.cp_enabled() {
-            crate::repair_document_into(
+            self.current.truncate(keep);
+            let mut parser = parser::Parser::new_stream_resumed(
                 &self.input,
                 self.opts,
-                &mut self.previous,
-                Some(&mut self.cp),
-            )
-        } else {
-            crate::repair_document_into(&self.input, self.opts, &mut self.previous, None)
-        };
-        match result {
-            Ok(()) => {
-                core::mem::swap(&mut self.previous, &mut self.current);
-                let keep = common_prefix_len(&self.previous, &self.current);
-                Ok(Delta {
-                    keep,
-                    text: &self.current[keep..],
-                })
+                &mut self.current,
+                &mut self.cp,
+            );
+            let (resumed, shift) = (parser.parse_resume(), parser.shifted_at());
+            if resumed.is_ok() {
+                return Ok(if delta {
+                    resumed_prefix_len(&self.current, keep, &self.previous, shift)
+                } else {
+                    0
+                });
             }
+            if delta {
+                // Put the previous output back: it is the diff base below.
+                if let Some(at) = shift {
+                    self.current.remove(at);
+                }
+                self.current.truncate(keep);
+                self.current.push_str(&self.previous);
+            }
+            // Fall through: the full render reports the canonical error.
+        }
+        // A full render records its own checkpoints (or none, when disabled);
+        // nothing from an earlier render may survive it.
+        self.cp.valid = false;
+        let cp = if self.cp_enabled() {
+            Some(&mut self.cp)
+        } else {
+            None
+        };
+        // Delta renders into the spare buffer so `current` stays the diff base.
+        let target = if delta {
+            &mut self.previous
+        } else {
+            &mut self.current
+        };
+        target.clear();
+        match crate::repair_document_into(&self.input, self.opts, target, cp) {
+            Ok(()) if delta => {
+                core::mem::swap(&mut self.previous, &mut self.current);
+                Ok(common_prefix_len(&self.previous, &self.current))
+            }
+            Ok(()) => Ok(0),
             Err(error) => {
                 self.cp.valid = false;
                 self.escape_scan.rollback();
                 self.input.truncate(before);
-                self.previous.clear();
+                if !delta {
+                    // `current` was the render target: restore the last good
+                    // rendering of the rolled-back input.
+                    self.current.clear();
+                    let _ = crate::repair_document_into(
+                        &self.input,
+                        self.opts,
+                        &mut self.current,
+                        None,
+                    );
+                }
                 Err(error)
             }
         }
@@ -304,15 +276,44 @@ impl Default for StreamRepairer {
 
 /// Length of the shared prefix of `a` and `b`, rounded to a character boundary.
 fn common_prefix_len(a: &str, b: &str) -> usize {
-    let (left, right) = (a.as_bytes(), b.as_bytes());
-    let mut len = 0usize;
-    while len < left.len() && len < right.len() && left[len] == right[len] {
+    char_floor(b, shared_bytes(a.as_bytes(), b.as_bytes()))
+}
+
+/// [`common_prefix_len`] of the previous output and `new`, without touching
+/// the stable prefix: the previous output was `new[..keep] + old_tail`,
+/// except that a retrofitted NDJSON `[` may since have been inserted at
+/// `shift` (old prefix byte `i >= shift` now sits at `new[i + 1]`).
+fn resumed_prefix_len(new: &str, keep: usize, old_tail: &str, shift: Option<usize>) -> usize {
+    let bytes = new.as_bytes();
+    let mut len = shift.unwrap_or(keep);
+    while len < keep && bytes[len + 1] == bytes[len] {
         len += 1;
     }
-    while len > 0 && !b.is_char_boundary(len) {
-        len -= 1;
+    if len == keep {
+        len += shared_bytes(old_tail.as_bytes(), &bytes[keep..]);
     }
-    len
+    char_floor(new, len)
+}
+
+/// Length of the shared prefix of two byte strings, compared a word at a time.
+fn shared_bytes(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n && crate::swar::load_word(a, i) == crate::swar::load_word(b, i) {
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// The largest character boundary of `text` at or below `index`.
+fn char_floor(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[cfg(test)]
@@ -383,68 +384,68 @@ mod fuzz_regressions2 {
         assert_eq!(o1, crate::repair(&acc).unwrap());
     }
 
-    #[test]
-    fn crash2546_exact_bytes() {
-        // Full fuzz input: first byte steers chunk size, rest is the document.
-        let data: &[u8] = &[
-            34, 123, 97, 58, 255, 92, 117, 48, 48, 101, 57, 26, 32, 32, 92, 255, 255, 255,
-        ];
+    /// Fuzz crash input 2546; the stream target reads it as (steer, text).
+    const CRASH_2546: &[u8] = &[
+        34, 123, 97, 58, 255, 92, 117, 48, 48, 101, 57, 26, 32, 32, 92, 255, 255, 255,
+    ];
+
+    /// Replays fuzz bytes the way `fuzz/fuzz_targets/stream.rs` does: the
+    /// first byte steers the chunk size (1..=32), the rest is the
+    /// lossy-decoded document, split forward onto char boundaries.
+    fn fuzz_chunks(data: &[u8]) -> alloc::vec::Vec<String> {
         let (&steer, rest) = data.split_first().expect("nonempty");
         let step = 1 + usize::from(steer % 32);
-        let text = alloc::string::String::from_utf8_lossy(rest);
-        let text = text.as_ref();
-        let mut s = StreamRepairer::new();
-        let mut acc = alloc::string::String::new();
+        let text = String::from_utf8_lossy(rest);
+        let mut chunks = alloc::vec::Vec::new();
         let mut start = 0;
         while start < text.len() {
             let mut end = (start + step).min(text.len());
-            if end < text.len() {
-                while end < text.len() && !text.is_char_boundary(end) {
-                    end += 1;
-                }
+            while !text.is_char_boundary(end) {
+                end += 1;
             }
-            let chunk = &text[start..end];
-            acc.push_str(chunk);
-            let got = s.push(chunk).map(alloc::string::String::from);
+            chunks.push(String::from(&text[start..end]));
+            start = end;
+        }
+        chunks
+    }
+
+    #[test]
+    fn crash2546_exact_bytes() {
+        let mut s = StreamRepairer::new();
+        let mut acc = String::new();
+        for chunk in fuzz_chunks(CRASH_2546) {
+            acc.push_str(&chunk);
+            let got = s.push(&chunk).map(String::from);
             let want = crate::repair(&acc);
             if got.is_err() && want.is_err() {
                 acc.truncate(acc.len() - chunk.len());
             } else {
                 assert_eq!(got, want, "at prefix {acc:?} (chunk {chunk:?})");
             }
-            start = end;
         }
     }
 
+    /// Fuzz inputs whose every render ends on an EOF-dependent value: no
+    /// push may leave a resume checkpoint behind (`must_repair`: every chunk
+    /// is also expected to repair).
     #[test]
-    fn probe_cp_after_each_chunk() {
-        let data: &[u8] = &[
-            34, 123, 97, 58, 255, 92, 117, 48, 48, 101, 57, 26, 32, 32, 92, 255, 255, 255,
+    fn eof_dependent_renders_never_checkpoint() {
+        let af2a: &[u8] = &[99, 123, 34, 97, 34, 0, 34, 0, 58, 32, 50, 169, 41];
+        let f245: &[u8] = &[
+            99, 123, 34, 97, 34, 58, 32, 49, 38, 50, 169, 41, 123, 97, 10, 10, 10, 10, 10, 10, 10,
+            86, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 236, 255, 255, 255, 10, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
         ];
-        let (&steer, rest) = data.split_first().expect("nonempty");
-        let step = 1 + usize::from(steer % 32);
-        let text = String::from_utf8_lossy(rest);
-        let text = text.as_ref();
-        let mut s = StreamRepairer::new();
-        let mut start = 0;
-        let mut n = 0;
-        while start < text.len() {
-            let mut end = (start + step).min(text.len());
-            if end < text.len() {
-                while end < text.len() && !text.is_char_boundary(end) {
-                    end += 1;
-                }
-            }
-            let chunk = &text[start..end];
-            let out = String::from(s.push(chunk).expect("push"));
-            if s.cp.valid {
-                panic!(
-                    "after chunk {n} [{start}..{end}] {chunk:?} out={out:?} cp={:?}",
-                    s.cp
+        for (data, must_repair) in [(CRASH_2546, true), (af2a, true), (f245, false)] {
+            let mut s = StreamRepairer::new();
+            for (n, chunk) in fuzz_chunks(data).iter().enumerate() {
+                let pushed = s.push(chunk).map(String::from);
+                assert!(
+                    !must_repair || pushed.is_ok(),
+                    "chunk {n} {chunk:?}: {pushed:?}"
                 );
+                assert!(!s.cp.valid, "after chunk {n} {chunk:?} cp={:?}", s.cp);
             }
-            start = end;
-            n += 1;
         }
     }
 
@@ -462,68 +463,5 @@ mod fuzz_regressions2 {
         );
         let o1 = String::from(s.push("ll").expect("chunk1"));
         assert_eq!(o1, crate::repair("null").unwrap());
-    }
-
-    #[test]
-    fn probe_af2a_cp() {
-        let data: &[u8] = &[99, 123, 34, 97, 34, 0, 34, 0, 58, 32, 50, 169, 41];
-        let (&steer, rest) = data.split_first().expect("x");
-        let step = 1 + usize::from(steer % 32u8);
-        let text = String::from_utf8_lossy(rest);
-        let text = text.as_ref();
-        let mut s = StreamRepairer::new();
-        let mut start = 0;
-        let mut n = 0;
-        while start < text.len() {
-            let mut end = (start + step).min(text.len());
-            if end < text.len() {
-                while end < text.len() && !text.is_char_boundary(end) {
-                    end += 1;
-                }
-            }
-            let chunk = &text[start..end];
-            let out = String::from(s.push(chunk).expect("p"));
-            if s.cp.valid {
-                panic!(
-                    "chunk {n} [{start}..{end}] {chunk:?} out={out:?} cp={:?}",
-                    s.cp
-                );
-            }
-            start = end;
-            n += 1;
-        }
-    }
-
-    #[test]
-    fn probe_24f5_cp() {
-        let data: &[u8] = &[
-            99, 123, 34, 97, 34, 58, 32, 49, 38, 50, 169, 41, 123, 97, 10, 10, 10, 10, 10, 10, 10,
-            86, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 236, 255, 255, 255, 10, 0, 0, 0, 0,
-            0, 0, 0, 0, 0,
-        ];
-        let (&steer, rest) = data.split_first().expect("x");
-        let step = 1 + usize::from(steer as u16 % 32);
-        let text = String::from_utf8_lossy(rest);
-        let text = text.as_ref();
-        let mut s = StreamRepairer::new();
-        let mut start = 0;
-        let mut n = 0;
-        while start < text.len() {
-            let mut end = (start + step).min(text.len());
-            if end < text.len() {
-                while end < text.len() && !text.is_char_boundary(end) {
-                    end += 1;
-                }
-            }
-            let chunk = &text[start..end];
-            if s.push(chunk).is_err() {
-                // rolled back; continue probing subsequent chunks
-            }
-            if s.cp.valid {
-                panic!("after chunk {n} [{start}..{end}] cp={:?}", s.cp);
-            }
-            start = end;
-            n += 1;
-        }
     }
 }

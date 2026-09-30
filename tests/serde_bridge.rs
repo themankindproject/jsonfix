@@ -95,3 +95,29 @@ fn non_finite_numbers_error_on_serialize_instead_of_becoming_strings() {
         "1234567890123456789"
     );
 }
+
+/// The consuming `From` conversions agree with the borrowing
+/// `to_serde_json` / `from_serde_json` on every value kind, including
+/// out-of-range numbers (kept as strings) and duplicate keys (last wins in
+/// `serde_json::Map`).
+#[test]
+fn consuming_conversions_match_the_borrowing_ones() {
+    let text = r#"{"a": [1, -2, 2.5, 1e400], "b": "text", "c": true, "d": null,
+        "big": 12345678901234567890, "e": {"x": [], "y": {}}, "a": "dup"}"#;
+    let mine = jsonfix::parse(text).expect("parses");
+    let borrowed = mine.to_serde_json();
+    let moved = serde_json::Value::from(mine.clone());
+    assert_eq!(moved, borrowed);
+    assert_eq!(moved["a"], "dup");
+    assert_eq!(moved["big"], serde_json::json!(12345678901234567890u64));
+
+    let nested = jsonfix::parse(r#"{"n": [1e400, 0.5, -7]}"#).expect("parses");
+    let json = serde_json::Value::from(nested);
+    assert_eq!(json["n"][0], "1e400");
+    assert_eq!(json["n"][1], 0.5);
+
+    let back = Value::from(moved.clone());
+    assert_eq!(back, Value::from_serde_json(&moved));
+    // `loads` uses the consuming path and still matches `to_serde_json`.
+    assert_eq!(jsonfix::loads(text).expect("loads"), borrowed);
+}

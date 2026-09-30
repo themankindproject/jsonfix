@@ -6,7 +6,6 @@
 
 use alloc::borrow::Cow;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::{Error, ErrorKind};
@@ -220,22 +219,17 @@ pub(crate) struct Parser<'a, 'b> {
     /// commas after a two-pass string end) depends on where the input
     /// happens to end, so no further stream checkpoints are safe.
     eof_dependent: bool,
+    /// Output offset of a retrofitted NDJSON `[` that is currently inserted
+    /// (the only write that lands *before* bytes already rendered).
+    shifted_at: Option<usize>,
+    /// Tree mode: completed values waiting for their parent to collect them
+    /// (top-level values stay here until `parse_document` returns them).
+    values: Vec<Value>,
 }
 
 impl<'a, 'b> Parser<'a, 'b> {
     pub(crate) fn new(input: &'a str, opts: Options) -> Self {
-        Self {
-            lexer: Lexer::new(input, opts),
-            peeked: None,
-            opts,
-            frames: Vec::with_capacity(FRAME_PREALLOC),
-            max_depth: 0,
-            top: TopState::default(),
-            out: None,
-            cp_slot: None,
-            resume_phase: None,
-            eof_dependent: false,
-        }
+        Self::with_sink(input, opts, None, None)
     }
 
     /// A stream-mode parser that appends repaired JSON to `out` and records
@@ -246,6 +240,15 @@ impl<'a, 'b> Parser<'a, 'b> {
         out: &'b mut String,
         cp: Option<&'b mut ResumeCp>,
     ) -> Self {
+        Self::with_sink(input, opts, Some(out), cp)
+    }
+
+    fn with_sink(
+        input: &'a str,
+        opts: Options,
+        out: Option<&'b mut String>,
+        cp_slot: Option<&'b mut ResumeCp>,
+    ) -> Self {
         Self {
             lexer: Lexer::new(input, opts),
             peeked: None,
@@ -253,10 +256,12 @@ impl<'a, 'b> Parser<'a, 'b> {
             frames: Vec::with_capacity(FRAME_PREALLOC),
             max_depth: 0,
             top: TopState::default(),
-            out: Some(out),
-            cp_slot: cp,
+            out,
+            cp_slot,
             resume_phase: None,
             eof_dependent: false,
+            shifted_at: None,
+            values: Vec::new(),
         }
     }
 
@@ -269,28 +274,28 @@ impl<'a, 'b> Parser<'a, 'b> {
         out: &'b mut String,
         cp: &'b mut ResumeCp,
     ) -> Self {
-        let phase = cp.phase;
-        let mut lexer = Lexer::new(input, opts);
-        lexer.set_pos(cp.input_pos);
-        let frames = cp.frames.clone();
-        let max_depth = frames.len();
-        Self {
-            lexer,
-            peeked: None,
-            opts,
-            frames,
-            max_depth,
-            top: cp.top,
-            out: Some(out),
-            cp_slot: Some(cp),
-            resume_phase: Some(phase),
-            eof_dependent: false,
+        let (phase, input_pos, top) = (cp.phase, cp.input_pos, cp.top);
+        let mut parser = Self::with_sink(input, opts, Some(out), Some(cp));
+        if let Some(cp) = parser.cp_slot.as_deref() {
+            parser.frames.extend_from_slice(&cp.frames);
         }
+        parser.lexer.set_pos(input_pos);
+        parser.max_depth = parser.frames.len();
+        parser.top = top;
+        parser.resume_phase = Some(phase);
+        parser
     }
 
     /// The deepest `frames.len()` reached so far (see the field docs).
     pub(crate) fn max_depth(&self) -> usize {
         self.max_depth
+    }
+
+    /// Where a retrofitted NDJSON `[` currently sits in the output, if one was
+    /// inserted by this parse: bytes before it are untouched, bytes after it
+    /// shifted right by one.
+    pub(crate) fn shifted_at(&self) -> Option<usize> {
+        self.shifted_at
     }
 
     /// Whether values are serialized directly instead of built into a tree.
@@ -332,45 +337,35 @@ impl<'a, 'b> Parser<'a, 'b> {
     /// The recorded frame list follows `phase`: [`CpPhase::ContinueParent`]
     /// excludes the container that just closed (its parent chain only).
     fn save_cp(&mut self, phase: CpPhase, stable: bool) {
-        if self.out.is_none() {
-            return;
-        }
-        if self.eof_dependent {
-            return;
-        }
         // `stable == false` means this boundary is *not* safe to resume from
         // (growable scalar, two-pass string end, EOF-invented null, …).
         // Callers already fold `at_end` into the flag where relevant — never
         // save an unstable checkpoint just because input happens to follow.
-        if !stable {
+        // Cheap exits first: `repair` (no slot) never records checkpoints.
+        if !stable || self.eof_dependent || self.cp_slot.is_none() {
             return;
         }
+        let Some(out_len) = self.out.as_ref().map(|out| out.len()) else {
+            return;
+        };
         let frames_len = match phase {
             CpPhase::ContinueParent => self.frames.len().saturating_sub(1),
             _ => self.frames.len(),
         };
-        if self.frames[..frames_len]
-            .iter()
-            .any(|f| f.kind == ContainerKind::Group)
-        {
+        let frames = &self.frames[..frames_len];
+        if frames.iter().any(|f| f.kind == ContainerKind::Group) {
             return;
         }
-        let pos = self.lexer.pos();
-        let out_len = match &self.out {
-            Some(out) => out.len(),
-            None => return,
-        };
-        let top = self.top;
         let Some(slot) = self.cp_slot.as_deref_mut() else {
             return;
         };
         slot.valid = true;
-        slot.input_pos = pos;
+        slot.input_pos = self.lexer.pos();
         slot.output_len = out_len;
         slot.phase = phase;
         slot.frames.clear();
-        slot.frames.extend_from_slice(&self.frames[..frames_len]);
-        slot.top = top;
+        slot.frames.extend_from_slice(frames);
+        slot.top = self.top;
     }
 
     /// Whether every repair pass is disabled.
@@ -416,78 +411,63 @@ impl<'a, 'b> Parser<'a, 'b> {
     /// Parses the whole input into one value, wrapping several top-level values
     /// into an array when NDJSON repair is enabled. Tree mode only.
     pub(crate) fn parse_document(&mut self) -> Result<Value, Error> {
-        let mut values = Vec::new();
-        self.parse_top(&mut values)?;
-        if values.len() == 1 {
-            Ok(values.pop().expect("one value parsed"))
-        } else {
-            // Wrapping several top-level values in one array adds a level
-            // that `enter()` never counted (the deepest value may already
-            // use the full budget). Reject before emitting a tree whose
-            // serialization fails `validate` / `MAX_NESTING_DEPTH`.
-            let max_member = values.iter().map(value_depth).max().unwrap_or(0);
-            if max_member >= MAX_NESTING_DEPTH {
-                return Err(Error::new(ErrorKind::DepthLimitExceeded, self.lexer.pos()));
-            }
-            Ok(Value::Array(values))
+        self.parse_top()?;
+        if self.top.count == 1 {
+            return Ok(self.pop_value());
         }
+        // Wrapping several top-level values in one array adds a level that
+        // `enter()` never counted (the deepest value may already use the full
+        // budget). Reject before emitting a tree whose serialization fails
+        // `validate` / `MAX_NESTING_DEPTH`.
+        if self.values.iter().map(value_depth).max().unwrap_or(0) >= MAX_NESTING_DEPTH {
+            return Err(Error::new(ErrorKind::DepthLimitExceeded, self.lexer.pos()));
+        }
+        Ok(Value::Array(core::mem::take(&mut self.values)))
     }
 
     /// Parses the whole document in stream mode: bytes are appended to
-    /// `self.out` and no tree is built (returned values are placeholders).
+    /// `self.out` and no tree is built.
     pub(crate) fn parse_document_stream(&mut self) -> Result<(), Error> {
-        let mut scratch = Vec::new();
-        self.parse_top(&mut scratch)
+        self.parse_top()
     }
 
     /// Continues a stream parse from a saved checkpoint (see
     /// [`Parser::new_stream_resumed`]). Rebuilds the suspended call chain:
     /// innermost container loop → parent value-arms → top-level driver.
     pub(crate) fn parse_resume(&mut self) -> Result<(), Error> {
-        let phase = self.resume_phase.unwrap_or(CpPhase::TopContinue);
-        let mut values: Vec<Value> = vec![Value::Null; self.top.count];
-        match phase {
-            CpPhase::TopContinue => self.top_continue(&mut values),
-            CpPhase::InContainer | CpPhase::ContinueParent => {
-                // ContinueParent: the innermost frame is already finished —
-                // apply its parent's value-arm tail before running that loop.
-                let mut need_tail = matches!(phase, CpPhase::ContinueParent);
-                loop {
-                    if self.frames.is_empty() {
-                        // The suspended top-level value is complete.
-                        values.push(Value::Null);
-                        self.top.count = values.len();
-                        return self.top_continue(&mut values);
-                    }
-                    if need_tail {
-                        let idx = self.frames.len() - 1;
-                        self.frames[idx].first = false;
-                        self.frames[idx].comma_pending = false;
-                    }
-                    need_tail = true;
-                    let kind = self.frames[self.frames.len() - 1].kind;
-                    match kind {
-                        ContainerKind::Object => {
-                            let _ = self.run_object_loop()?;
-                        }
-                        ContainerKind::Array => {
-                            let _ = self.run_array_loop()?;
-                        }
-                        // Groups never create checkpoints.
-                        ContainerKind::Group => {
-                            return Err(Error::new(ErrorKind::UnexpectedEnd, self.position()));
-                        }
-                    }
-                    self.leave();
-                }
+        // ContinueParent: the innermost frame is already finished — apply its
+        // parent's value-arm tail before running that loop.
+        let mut need_tail = match self.resume_phase.unwrap_or(CpPhase::TopContinue) {
+            CpPhase::TopContinue => return self.top_continue(),
+            CpPhase::InContainer => false,
+            CpPhase::ContinueParent => true,
+        };
+        while let Some(frame) = self.frames.last_mut() {
+            if need_tail {
+                frame.first = false;
+                frame.comma_pending = false;
             }
+            need_tail = true;
+            let kind = frame.kind;
+            match kind {
+                ContainerKind::Object => self.run_object_loop()?,
+                ContainerKind::Array => self.run_array_loop()?,
+                // Groups never create checkpoints.
+                ContainerKind::Group => {
+                    return Err(Error::new(ErrorKind::UnexpectedEnd, self.position()));
+                }
+            };
+            self.leave();
         }
+        // The suspended top-level value is complete.
+        self.top.count += 1;
+        self.top_continue()
     }
 
-    /// Shared top-level driver for both modes. `values` collects the parsed
-    /// values in tree mode; stream mode pushes placeholder `Null`s so the
-    /// value *count* (used for NDJSON `[...]` wrapping) stays identical.
-    fn parse_top(&mut self, values: &mut Vec<Value>) -> Result<(), Error> {
+    /// Shared top-level driver for both modes. Completed top-level values are
+    /// counted in `top.count` (used for NDJSON `[...]` wrapping); tree mode
+    /// also keeps them on the value stack.
+    fn parse_top(&mut self) -> Result<(), Error> {
         let position = self.position();
         // A first value that is a multi-word bare string is prose (the
         // document contract: prose must go through `extract`, not wrap into
@@ -503,30 +483,32 @@ impl<'a, 'b> Parser<'a, 'b> {
         );
         // Byte offset where the first value's output starts; stream mode
         // retrofits `[` here if a second top-level value appears.
-        let first_pos = self.emit().map(|out| out.len()).unwrap_or(0);
+        let first_pos = self.out.as_ref().map_or(0, |out| out.len());
         self.top = TopState {
             first_pos,
             prose_first,
             count: 0,
         };
-        // A truncated first value (unclosed string/number/word, or the
-        // two-pass string rule that stops on a raw delimiter at "logical"
-        // EOF while `pos` still sits before trailing input) is growable:
-        // a later chunk continues *this* value rather than starting another.
-        // `!at_end` alone is not enough — `"a#\n` stops at the newline with
-        // pos < len and would otherwise checkpoint as a finished value.
-        let Some(first) = self.parse_value()? else {
+        // No checkpoint after a top-level value: a scalar at EOF may still
+        // grow (`"a#\n` stops at the newline with pos < len), and a closed
+        // container already saved its own ContinueParent boundary.
+        if !self.parse_value()? {
             return Err(Error::new(ErrorKind::NoValueFound, position));
-        };
-        values.push(first);
+        }
         self.top.count = 1;
-        self.save_cp(CpPhase::TopContinue, false);
-        self.top_continue(values)
+        self.top_continue()
+    }
+
+    /// Pops the value the last successful `parse_value` pushed (tree mode).
+    fn pop_value(&mut self) -> Value {
+        self.values
+            .pop()
+            .expect("tree mode pushes one value per parsed value")
     }
 
     /// The top-level loop after the first value has been parsed (also the
     /// resume entry for [`CpPhase::TopContinue`]).
-    fn top_continue(&mut self, values: &mut Vec<Value>) -> Result<(), Error> {
+    fn top_continue(&mut self) -> Result<(), Error> {
         let first_pos = self.top.first_pos;
         let prose_first = self.top.prose_first;
         loop {
@@ -555,10 +537,7 @@ impl<'a, 'b> Parser<'a, 'b> {
                         | Tag::CloseBracket),
                     ) => {
                         if self.strict() {
-                            return Err(Error::new(
-                                ErrorKind::UnexpectedCharacter(tag.punct_char()),
-                                self.position(),
-                            ));
+                            return Err(self.unexpected(tag));
                         }
                         self.take();
                     }
@@ -587,16 +566,16 @@ impl<'a, 'b> Parser<'a, 'b> {
             // valid JSON. `insert` shifts the buffer, so rollback is explicit
             // rather than a truncate to a pre-insert length.
             let base = self.emit().map(|out| out.len());
-            let wraps_first = values.len() == 1;
-            let inserted_bracket = self.emit().is_some() && wraps_first;
+            let wraps_first = self.top.count == 1;
+            let inserted_bracket = self.streaming() && wraps_first;
             if wraps_first {
                 // The wrap adds one nesting level that `enter()` never counted
                 // for the first value (it may already use the full budget).
                 // Measure only this document's rendering (`first_pos..`): the
                 // buffer may hold caller-provided text before it.
-                let first_depth = match self.emit() {
+                let first_depth = match self.out.as_deref() {
                     Some(out) => structural_depth(&out[first_pos..]),
-                    None => value_depth(&values[0]),
+                    None => value_depth(&self.values[0]),
                 };
                 if first_depth >= MAX_NESTING_DEPTH {
                     return Err(Error::new(ErrorKind::DepthLimitExceeded, self.position()));
@@ -609,16 +588,13 @@ impl<'a, 'b> Parser<'a, 'b> {
                 out.push_str(", ");
             }
             if inserted_bracket {
+                self.shifted_at = Some(first_pos);
                 self.invalidate_cp_from(first_pos);
             }
             // The value tag is already peeked (starts_value check above).
             match self.parse_value()? {
-                Some(value) => {
-                    values.push(value);
-                    self.top.count = values.len();
-                    self.save_cp(CpPhase::TopContinue, false);
-                }
-                None => {
+                true => self.top.count += 1,
+                false => {
                     if let (Some(out), Some(base)) = (self.emit(), base) {
                         // Drop `, ` plus anything `parse_value` wrote, keep
                         // the bracket (if any) for the explicit remove below.
@@ -628,14 +604,15 @@ impl<'a, 'b> Parser<'a, 'b> {
                         }
                     }
                     if inserted_bracket {
+                        self.shifted_at = None;
                         self.invalidate_cp_from(first_pos);
                     }
                     break;
                 }
             }
         }
-        if let Some(out) = self.emit() {
-            if values.len() > 1 {
+        if self.top.count > 1 {
+            if let Some(out) = self.emit() {
                 out.push(']');
             }
         }
@@ -653,11 +630,12 @@ impl<'a, 'b> Parser<'a, 'b> {
     fn fill(&mut self, key_position: bool) -> Result<(), Error> {
         if self.peeked.is_none() {
             self.lexer.set_in_container(!self.frames.is_empty());
-            let spanned = self.lexer.next_token(key_position)?;
-            self.peeked = spanned.map(|spanned| {
+            if let Some(spanned) = self.lexer.next_token(key_position)? {
                 let tag = Tag::of(&spanned.token);
-                (spanned, tag)
-            });
+                // `get_or_insert` (the slot is known empty) skips the drop of
+                // a previous token that a plain assignment would emit.
+                self.peeked.get_or_insert((spanned, tag));
+            }
         }
         Ok(())
     }
@@ -676,28 +654,21 @@ impl<'a, 'b> Parser<'a, 'b> {
 }
 
 impl Parser<'_, '_> {
-    /// Parses one value.
+    /// Parses one value: renders it (stream mode) or pushes it onto the value
+    /// stack (tree mode).
     ///
-    /// Returns `None` when there is no value at the cursor, and also when the
+    /// Returns `false` when there is no value at the cursor, and also when the
     /// value was incomplete and the partial policy (see [`Allow`]) dropped it.
-    fn parse_value(&mut self) -> Result<Option<Value>, Error> {
+    fn parse_value(&mut self) -> Result<bool, Error> {
         // Stray separators before a value are dropped (but not in strict mode).
         while let Some(tag @ (Tag::Ellipsis | Tag::Semicolon | Tag::Plus)) = self.peek_tag(false)? {
             if self.strict() {
-                let c = match tag {
-                    Tag::Ellipsis => '.',
-                    Tag::Semicolon => ';',
-                    _ => '+',
-                };
-                return Err(Error::new(
-                    ErrorKind::UnexpectedCharacter(c),
-                    self.position(),
-                ));
+                return Err(self.unexpected(tag));
             }
             self.take();
         }
         let Some(tag) = self.peek_tag(false)? else {
-            return Ok(None);
+            return Ok(false);
         };
         match tag {
             Tag::OpenBrace => self.parse_object(),
@@ -705,49 +676,31 @@ impl Parser<'_, '_> {
             Tag::OpenParen => self.parse_group(),
             Tag::Str { truncated } => self.parse_string_value(truncated),
             Tag::Num { truncated } => {
-                let spanned = self.take();
+                let Token::Num { text, .. } = self.take().token else {
+                    return Ok(false);
+                };
                 if truncated && !self.opts.allows(Allow::NUM) {
-                    return Ok(None);
+                    return Ok(false);
                 }
-                if truncated {
-                    self.eof_dependent = true;
+                self.eof_dependent |= truncated;
+                // The number text is already valid JSON.
+                match self.out.as_deref_mut() {
+                    Some(out) => out.push_str(&text),
+                    None => self
+                        .values
+                        .push(Value::Number(Number::from_normalized(text.into_owned()))),
                 }
-                match spanned.token {
-                    Token::Num { text, .. } => {
-                        if let Some(out) = self.emit() {
-                            // Stream mode: append the number text (already
-                            // valid JSON) and report a placeholder.
-                            out.push_str(&text);
-                            Ok(Some(Value::Null))
-                        } else {
-                            Ok(Some(Value::Number(Number::from_normalized(
-                                text.into_owned(),
-                            ))))
-                        }
-                    }
-                    _ => Ok(None),
-                }
+                Ok(true)
             }
             Tag::Bool => {
-                let spanned = self.take();
-                match spanned.token {
-                    Token::Bool(value) => {
-                        if let Some(out) = self.emit() {
-                            out.push_str(if value { "true" } else { "false" });
-                            Ok(Some(Value::Null))
-                        } else {
-                            Ok(Some(Value::Bool(value)))
-                        }
-                    }
-                    _ => Ok(None),
-                }
+                let Token::Bool(value) = self.take().token else {
+                    return Ok(false);
+                };
+                Ok(self.produce(if value { "true" } else { "false" }, Value::Bool(value)))
             }
             Tag::Null | Tag::Undefined => {
                 self.take();
-                if let Some(out) = self.emit() {
-                    out.push_str("null");
-                }
-                Ok(Some(Value::Null))
+                Ok(self.produce("null", Value::Null))
             }
             Tag::Word { .. } => self.parse_word_value(),
             Tag::CloseBrace
@@ -757,19 +710,38 @@ impl Parser<'_, '_> {
             | Tag::Comma
             | Tag::Semicolon
             | Tag::Plus
-            | Tag::Ellipsis => Ok(None),
+            | Tag::Ellipsis => Ok(false),
         }
     }
 
+    /// Produces a non-string scalar: its JSON text (stream) or `value` (tree).
+    fn produce(&mut self, json: &str, value: Value) -> bool {
+        match self.out.as_deref_mut() {
+            Some(out) => out.push_str(json),
+            None => self.values.push(value),
+        }
+        true
+    }
+
+    /// Produces a string value: escaped into the output (stream) or pushed as
+    /// a tree node.
+    fn produce_str(&mut self, text: Cow<'_, str>) -> bool {
+        match self.out.as_deref_mut() {
+            Some(out) => write_escaped(out, &text),
+            None => self.values.push(Value::String(text.into_owned())),
+        }
+        true
+    }
+
     /// A parenthesised value, as produced by JavaScript-ish serializers.
-    fn parse_group(&mut self) -> Result<Option<Value>, Error> {
+    fn parse_group(&mut self) -> Result<bool, Error> {
         self.enter(ContainerKind::Group)?;
         let result = self.parse_group_inner();
         self.leave();
         result
     }
 
-    fn parse_group_inner(&mut self) -> Result<Option<Value>, Error> {
+    fn parse_group_inner(&mut self) -> Result<bool, Error> {
         if self.strict() {
             // Parenthesised values are not JSON: reject them in strict mode
             // (both `(1)` and a cut-off `(1`), like any other repair pass.
@@ -789,7 +761,7 @@ impl Parser<'_, '_> {
                 Some(Tag::Semicolon) => {
                     self.take();
                 }
-                Some(tag) if tag.starts_value() && inner.is_none() => {
+                Some(tag) if tag.starts_value() && !inner => {
                     inner = self.parse_value()?;
                 }
                 _ => break,
@@ -798,21 +770,14 @@ impl Parser<'_, '_> {
         Ok(inner)
     }
 
-    fn parse_string_value(&mut self, truncated: bool) -> Result<Option<Value>, Error> {
+    fn parse_string_value(&mut self, truncated: bool) -> Result<bool, Error> {
         let spanned = self.take();
-        let start = spanned.start;
         let Token::Str { text, .. } = spanned.token else {
-            return Ok(None);
+            return Ok(false);
         };
-        if truncated && !self.opts.repairs(Repairs::TRUNCATION) {
-            return Err(Error::new(ErrorKind::UnexpectedEnd, start));
-        }
-        if truncated && !self.opts.allows(Allow::STR) {
-            return Ok(None);
-        }
-        if truncated {
-            // Two-pass / EOF string end: following separators are not stable.
-            self.eof_dependent = true;
+        // A two-pass / EOF string end: following separators are not stable.
+        if !self.accept_truncated(truncated, spanned.start)? {
+            return Ok(false);
         }
         // `"long text" + "more text"`: string concatenation across a line break.
         // The lookahead only lexes when needed (context-free `+`, then a
@@ -855,14 +820,8 @@ impl Parser<'_, '_> {
                         // without TRUNCATION, the whole (incomplete) value
                         // dropped without `Allow::STR`, and no stable stream
                         // checkpoint after it.
-                        if segment_truncated {
-                            if !self.opts.repairs(Repairs::TRUNCATION) {
-                                return Err(Error::new(ErrorKind::UnexpectedEnd, segment_start));
-                            }
-                            if !self.opts.allows(Allow::STR) {
-                                return Ok(None);
-                            }
-                            self.eof_dependent = true;
+                        if !self.accept_truncated(segment_truncated, segment_start)? {
+                            return Ok(false);
                         }
                         text.to_mut().push_str(&next);
                     }
@@ -870,20 +829,33 @@ impl Parser<'_, '_> {
                 _ => break,
             }
         }
-        if let Some(out) = self.emit() {
-            write_escaped(out, &text);
-            Ok(Some(Value::Null))
-        } else {
-            Ok(Some(Value::String(text.into_owned())))
+        Ok(self.produce_str(text))
+    }
+
+    /// The policy for a string-like token cut off at end of input: an error
+    /// without `TRUNCATION`, dropped (`false`) without `Allow::STR`, and
+    /// otherwise kept — after which no stream checkpoint is stable. Complete
+    /// tokens always pass.
+    fn accept_truncated(&mut self, truncated: bool, start: usize) -> Result<bool, Error> {
+        if !truncated {
+            return Ok(true);
         }
+        if !self.opts.repairs(Repairs::TRUNCATION) {
+            return Err(Error::new(ErrorKind::UnexpectedEnd, start));
+        }
+        if !self.opts.allows(Allow::STR) {
+            return Ok(false);
+        }
+        self.eof_dependent = true;
+        Ok(true)
     }
 
     /// A bare word: either a function-call wrapper or an unquoted string.
-    fn parse_word_value(&mut self) -> Result<Option<Value>, Error> {
+    fn parse_word_value(&mut self) -> Result<bool, Error> {
         let spanned = self.take();
         let start = spanned.start;
         let Token::Word { text, truncated } = spanned.token else {
-            return Ok(None);
+            return Ok(false);
         };
         // Same lookahead discipline as parse_string_value: only lex `(` —
         // any other next char must stay unlexed so a following object key
@@ -904,24 +876,11 @@ impl Parser<'_, '_> {
         if !self.opts.repairs(Repairs::UNQUOTED) {
             return Err(Error::new(ErrorKind::UnquotedValue, start));
         }
-        // A word cut off by truncation is treated like a cut-off string:
-        // an error when truncation repair is off, a drop when the partial
-        // policy does not allow strings.
-        if truncated && !self.opts.repairs(Repairs::TRUNCATION) {
-            return Err(Error::new(ErrorKind::UnexpectedEnd, start));
+        // A word cut off by truncation is treated like a cut-off string.
+        if !self.accept_truncated(truncated, start)? {
+            return Ok(false);
         }
-        if truncated && !self.opts.allows(Allow::STR) {
-            return Ok(None);
-        }
-        if truncated {
-            self.eof_dependent = true;
-        }
-        if let Some(out) = self.emit() {
-            write_escaped(out, text);
-            Ok(Some(Value::Null))
-        } else {
-            Ok(Some(Value::String(String::from(text))))
-        }
+        Ok(self.produce_str(Cow::Borrowed(text)))
     }
 }
 
@@ -929,8 +888,8 @@ impl Parser<'_, '_> {
 enum KeyStep<'a> {
     /// A usable key, plus whether it was cut off at end of input.
     ///
-    /// Quoted/numeric keys borrow the input slice; word/keyword keys own a
-    /// short `String`.
+    /// Keys borrow the input (or a static keyword) unless a repair decoded
+    /// them into an owned buffer.
     Key(Cow<'a, str>, bool),
     /// Nothing key-like: one token was consumed, keep looking.
     Skip,
@@ -943,54 +902,37 @@ impl<'a> Parser<'a, '_> {
         let Some(tag) = self.peek_tag(true)? else {
             return Ok(KeyStep::Stop);
         };
-        match tag {
-            Tag::Str { truncated } => {
-                let spanned = self.take();
-                match spanned.token {
-                    Token::Str { text, .. } => Ok(KeyStep::Key(text, truncated)),
-                    _ => Ok(KeyStep::Skip),
-                }
+        if !matches!(
+            tag,
+            Tag::Str { .. }
+                | Tag::Word { .. }
+                | Tag::Num { .. }
+                | Tag::Bool
+                | Tag::Null
+                | Tag::Undefined
+        ) {
+            if self.strict() {
+                return Err(Error::new(ErrorKind::ExpectedObjectKey, self.position()));
             }
-            Tag::Word { truncated } => {
-                let spanned = self.take();
-                let start = spanned.start;
-                let Token::Word { text, .. } = spanned.token else {
-                    return Ok(KeyStep::Skip);
-                };
-                if !self.opts.repairs(Repairs::UNQUOTED) {
-                    return Err(Error::new(ErrorKind::UnquotedValue, start));
-                }
-                Ok(KeyStep::Key(Cow::Owned(String::from(text)), truncated))
-            }
-            Tag::Num { truncated } => {
-                let spanned = self.take();
-                match spanned.token {
-                    Token::Num { text, .. } => Ok(KeyStep::Key(text, truncated)),
-                    _ => Ok(KeyStep::Skip),
-                }
-            }
-            Tag::Bool => {
-                let spanned = self.take();
-                match spanned.token {
-                    Token::Bool(value) => Ok(KeyStep::Key(
-                        Cow::Owned(String::from(if value { "true" } else { "false" })),
-                        false,
-                    )),
-                    _ => Ok(KeyStep::Skip),
-                }
-            }
-            Tag::Null | Tag::Undefined => {
-                self.take();
-                Ok(KeyStep::Key(Cow::Borrowed("null"), false))
-            }
-            _ => {
-                if self.strict() {
-                    return Err(Error::new(ErrorKind::ExpectedObjectKey, self.position()));
-                }
-                self.take();
-                Ok(KeyStep::Skip)
-            }
+            self.take();
+            return Ok(KeyStep::Skip);
         }
+        let spanned = self.take();
+        Ok(match spanned.token {
+            Token::Str { text, truncated } | Token::Num { text, truncated } => {
+                KeyStep::Key(text, truncated)
+            }
+            Token::Word { text, truncated } => {
+                if !self.opts.repairs(Repairs::UNQUOTED) {
+                    return Err(Error::new(ErrorKind::UnquotedValue, spanned.start));
+                }
+                KeyStep::Key(Cow::Borrowed(text), truncated)
+            }
+            Token::Bool(value) => {
+                KeyStep::Key(Cow::Borrowed(if value { "true" } else { "false" }), false)
+            }
+            _ => KeyStep::Key(Cow::Borrowed("null"), false),
+        })
     }
 
     /// Tree: push a null-valued member. Stream: emit `, ` + `key: null`.
@@ -1023,70 +965,125 @@ impl<'a> Parser<'a, '_> {
         self.save_cp(CpPhase::InContainer, stable);
     }
 
-    fn parse_object(&mut self) -> Result<Option<Value>, Error> {
-        self.enter(ContainerKind::Object)?;
-        self.take();
-        // Fresh parses write the opener here; a resume finds it already in
-        // the output prefix (the wrapper is not used on resume).
-        if let Some(out) = self.emit() {
-            out.push('{');
-        }
+    fn parse_object(&mut self) -> Result<bool, Error> {
+        self.open_container(ContainerKind::Object, '{')?;
         let result = self.run_object_loop();
         self.leave();
         result
     }
 
+    fn parse_array(&mut self) -> Result<bool, Error> {
+        self.open_container(ContainerKind::Array, '[')?;
+        let result = self.run_array_loop();
+        self.leave();
+        result
+    }
+
+    /// Enters a container and consumes its opener. Fresh parses write the
+    /// opener here; a resume finds it already in the output prefix (the loops
+    /// are entered directly on resume).
+    fn open_container(&mut self, kind: ContainerKind, opener: char) -> Result<(), Error> {
+        self.enter(kind)?;
+        self.take();
+        if let Some(out) = self.emit() {
+            out.push(opener);
+        }
+        Ok(())
+    }
+
+    /// Handles what may sit between members/elements — separators, closers,
+    /// and noise — for both container loops. `own` is the closer that
+    /// matches the container; strict mode rejects the other one.
+    fn separator_step(&mut self, idx: usize, key_position: bool, own: Tag) -> Result<Step, Error> {
+        let Frame {
+            first,
+            comma_pending,
+            ..
+        } = self.frames[idx];
+        match self.peek_tag(key_position)? {
+            None => return Ok(Step::End),
+            Some(tag @ (Tag::CloseBrace | Tag::CloseBracket)) => {
+                if tag != own && self.strict() {
+                    return Err(self.unexpected(tag));
+                }
+                if comma_pending && self.strict() {
+                    return Err(Error::new(ErrorKind::TrailingComma, self.position()));
+                }
+                self.take();
+                return Ok(Step::Closed);
+            }
+            Some(Tag::Comma) => {
+                self.take();
+                // A leading or doubled comma is dropped when repairing.
+                if (first || comma_pending) && self.strict() {
+                    return Err(Error::new(ErrorKind::TrailingComma, self.position()));
+                }
+                self.frames[idx].comma_pending = true;
+                // A consumed comma is a stable boundary even at EOF.
+                self.save_cp(CpPhase::InContainer, true);
+                return Ok(Step::Again);
+            }
+            Some(tag @ (Tag::Semicolon | Tag::Ellipsis | Tag::Colon | Tag::Plus)) => {
+                if self.strict() {
+                    return Err(self.unexpected(tag));
+                }
+                self.take();
+                return Ok(Step::Again);
+            }
+            _ => {}
+        }
+        if !first && !comma_pending && self.strict() {
+            return Err(Error::new(ErrorKind::ExpectedComma, self.position()));
+        }
+        Ok(Step::Member)
+    }
+
+    /// `UnexpectedCharacter` for a punctuation token at the cursor.
+    fn unexpected(&self, tag: Tag) -> Error {
+        Error::new(
+            ErrorKind::UnexpectedCharacter(tag.punct_char()),
+            self.position(),
+        )
+    }
+
+    /// Stream mode: writes the `, ` separator (unless this is the first
+    /// member) and returns the rollback mark for a value that does not
+    /// materialize. Tree mode: `None`.
+    fn separator_mark(&mut self, idx: usize) -> Option<usize> {
+        let first = self.frames[idx].first;
+        let out = self.out.as_deref_mut()?;
+        let mark = out.len();
+        if !first {
+            out.push_str(", ");
+        }
+        Some(mark)
+    }
+
+    /// Undoes a stream-mode member rendering back to `mark`.
+    fn rollback(&mut self, mark: Option<usize>) {
+        if let (Some(out), Some(mark)) = (self.out.as_deref_mut(), mark) {
+            out.truncate(mark);
+        }
+    }
+
+    /// Marks a member/element as done for the separator rules.
+    fn member_done(&mut self, idx: usize) {
+        self.frames[idx].first = false;
+        self.frames[idx].comma_pending = false;
+    }
+
     /// The member loop. The caller has consumed `{` (fresh) or the cursor
     /// sits just past it (resume); the frame for this object is already on
     /// `self.frames`.
-    fn run_object_loop(&mut self) -> Result<Option<Value>, Error> {
+    fn run_object_loop(&mut self) -> Result<bool, Error> {
         let idx = self.frames.len() - 1;
         let mut members: Vec<(String, Value)> = Vec::new();
-        let mut closed = false;
-        loop {
-            let first = self.frames[idx].first;
-            let comma_pending = self.frames[idx].comma_pending;
-            match self.peek_tag(true)? {
-                None => break,
-                Some(tag @ (Tag::CloseBrace | Tag::CloseBracket)) => {
-                    if !matches!(tag, Tag::CloseBrace) && self.strict() {
-                        return Err(Error::new(
-                            ErrorKind::UnexpectedCharacter(tag.punct_char()),
-                            self.position(),
-                        ));
-                    }
-                    if comma_pending && self.strict() {
-                        return Err(Error::new(ErrorKind::TrailingComma, self.position()));
-                    }
-                    self.take();
-                    closed = true;
-                    break;
-                }
-                Some(Tag::Comma) => {
-                    self.take();
-                    // A leading or doubled comma is dropped when repairing.
-                    if (first || comma_pending) && self.strict() {
-                        return Err(Error::new(ErrorKind::TrailingComma, self.position()));
-                    }
-                    self.frames[idx].comma_pending = true;
-                    // A consumed comma is a stable boundary even at EOF.
-                    self.save_cp(CpPhase::InContainer, true);
-                    continue;
-                }
-                Some(tag @ (Tag::Semicolon | Tag::Ellipsis | Tag::Colon | Tag::Plus)) => {
-                    if self.strict() {
-                        return Err(Error::new(
-                            ErrorKind::UnexpectedCharacter(tag.punct_char()),
-                            self.position(),
-                        ));
-                    }
-                    self.take();
-                    continue;
-                }
-                _ => {}
-            }
-            if !first && !comma_pending && self.strict() {
-                return Err(Error::new(ErrorKind::ExpectedComma, self.position()));
+        let closed = loop {
+            match self.separator_step(idx, true, Tag::CloseBrace)? {
+                Step::Again => continue,
+                Step::Closed => break true,
+                Step::End => break false,
+                Step::Member => {}
             }
             // A structural value at key position ends this object; the
             // parent decides what to do with it (`[{"i":1,{"i":2}]` → two
@@ -1096,12 +1093,12 @@ impl<'a> Parser<'a, '_> {
                 self.peek_tag(true)?,
                 Some(Tag::OpenBrace | Tag::OpenBracket)
             ) {
-                break;
+                break false;
             }
             let (key, key_truncated) = match self.parse_key()? {
                 KeyStep::Key(key, truncated) => (key, truncated),
                 KeyStep::Skip => continue,
-                KeyStep::Stop => break,
+                KeyStep::Stop => break false,
             };
             if key_truncated {
                 // A key growable at EOF: later checkpoints are unsafe, and a
@@ -1111,7 +1108,7 @@ impl<'a> Parser<'a, '_> {
                     return Err(Error::new(ErrorKind::UnexpectedEnd, self.position()));
                 }
                 if !self.opts.allows(Allow::KEY) {
-                    break;
+                    break false;
                 }
             }
             match self.peek_tag(false)? {
@@ -1129,7 +1126,7 @@ impl<'a> Parser<'a, '_> {
                         // Key itself may have been lexed at EOF: unstable.
                         self.emit_null_member(&mut members, key, false);
                     }
-                    break;
+                    break false;
                 }
                 Some(other) if other.starts_value() => {
                     if self.strict() {
@@ -1143,205 +1140,120 @@ impl<'a> Parser<'a, '_> {
                     continue;
                 }
             }
-            // Colon consumed but end of input: `{"foo":` → `{"foo": null}`.
-            // (A value token that exists but is dropped by the Allow policy
-            // is handled below, not here.)
-            if self.peek_tag(false)?.is_none() {
-                if self.opts.repairs(Repairs::TRUNCATION) {
-                    // The *null* is invented from EOF — appending input can
-                    // replace it with a real value, so this is NOT a stable
-                    // checkpoint even though the key was bounded by `:`.
-                    self.emit_null_member(&mut members, key, false);
-                }
-                break;
-            }
-            // The next token cannot start a value: the value is missing
-            // entirely — insert `null` (`{"a":}` → `{"a": null}`), the
-            // reference repairs missing object values unconditionally.
-            if matches!(
-                self.peek_tag(false)?,
-                Some(Tag::CloseBrace | Tag::CloseBracket | Tag::Comma | Tag::Semicolon)
-            ) && !self.strict()
-            {
-                self.emit_null_member(&mut members, key, false);
-                continue;
-            }
-            // Stream: write `key: ` first; the value appends itself, and a
-            // `None` result (impossible under Allow::ALL) rolls the member
-            // back so no dangling `key: ` remains.
-            self.peek_tag(false)?; // fill the value token before inspecting it
-            let mark = if let Some(out) = self.emit() {
-                let mark = out.len();
-                if !first {
-                    out.push_str(", ");
-                }
-                write_escaped(out, &key);
-                out.push_str(": ");
-                Some(mark)
-            } else {
-                None
-            };
-            match self.parse_value()? {
-                Some(value) => {
-                    if mark.is_none() {
-                        members.push((key.into_owned(), value));
-                    }
-                }
-                None => {
-                    if let (Some(out), Some(mark)) = (self.emit(), mark) {
-                        out.truncate(mark);
-                    }
-                    break;
-                }
-            }
-            self.frames[idx].first = false;
-            self.frames[idx].comma_pending = false;
-            // Member finished; checkpoint when input follows and the value
-            // was not growable (truncated scalar / two-pass string end).
-            self.save_cp(CpPhase::InContainer, false);
-        }
-        let keep = self.finish_collection(closed, Allow::OBJ)?;
-        if let Some(out) = self.emit() {
-            // Stream mode only runs under Allow::ALL, where `keep` is always
-            // true — the closer is written once, whether the object closed
-            // explicitly or was closed by truncation repair.
-            debug_assert!(keep);
-            out.push('}');
-        }
-        if closed && self.streaming() {
-            // Closed by a real `}`: a stable boundary for the parent's
-            // value-arm resume, even when `}` is the last input byte.
-            self.save_cp(CpPhase::ContinueParent, true);
-        }
-        if keep {
-            if self.streaming() {
-                Ok(Some(Value::Null))
-            } else {
-                Ok(Some(Value::Object(members)))
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<Option<Value>, Error> {
-        self.enter(ContainerKind::Array)?;
-        self.take();
-        if let Some(out) = self.emit() {
-            out.push('[');
-        }
-        let result = self.run_array_loop();
-        self.leave();
-        result
-    }
-
-    /// The element loop (see [`Self::run_object_loop`]; same resume rules).
-    fn run_array_loop(&mut self) -> Result<Option<Value>, Error> {
-        let idx = self.frames.len() - 1;
-        let mut items: Vec<Value> = Vec::new();
-        let mut closed = false;
-        loop {
-            let first = self.frames[idx].first;
-            let comma_pending = self.frames[idx].comma_pending;
             match self.peek_tag(false)? {
-                None => break,
-                Some(tag @ (Tag::CloseBracket | Tag::CloseBrace)) => {
-                    if !matches!(tag, Tag::CloseBracket) && self.strict() {
-                        return Err(Error::new(
-                            ErrorKind::UnexpectedCharacter(tag.punct_char()),
-                            self.position(),
-                        ));
+                // Colon consumed but end of input: `{"foo":` → `{"foo": null}`.
+                // The *null* is invented from EOF — appending input can
+                // replace it with a real value, so this is NOT a stable
+                // checkpoint even though the key was bounded by `:`.
+                None => {
+                    if self.opts.repairs(Repairs::TRUNCATION) {
+                        self.emit_null_member(&mut members, key, false);
                     }
-                    if comma_pending && self.strict() {
-                        return Err(Error::new(ErrorKind::TrailingComma, self.position()));
-                    }
-                    self.take();
-                    closed = true;
-                    break;
+                    break false;
                 }
-                Some(Tag::Comma) => {
-                    self.take();
-                    if (first || comma_pending) && self.strict() {
-                        return Err(Error::new(ErrorKind::TrailingComma, self.position()));
-                    }
-                    self.frames[idx].comma_pending = true;
-                    self.save_cp(CpPhase::InContainer, true);
-                    continue;
-                }
-                Some(tag @ (Tag::Semicolon | Tag::Ellipsis | Tag::Colon | Tag::Plus)) => {
-                    if self.strict() {
-                        return Err(Error::new(
-                            ErrorKind::UnexpectedCharacter(tag.punct_char()),
-                            self.position(),
-                        ));
-                    }
-                    self.take();
+                // The next token cannot start a value: the value is missing
+                // entirely — insert `null` (`{"a":}` → `{"a": null}`), the
+                // reference repairs missing object values unconditionally.
+                Some(Tag::CloseBrace | Tag::CloseBracket | Tag::Comma | Tag::Semicolon)
+                    if !self.strict() =>
+                {
+                    self.emit_null_member(&mut members, key, false);
                     continue;
                 }
                 _ => {}
             }
-            if !first && !comma_pending && self.strict() {
-                return Err(Error::new(ErrorKind::ExpectedComma, self.position()));
+            // Stream: write `key: ` first; the value appends itself, and a
+            // dropped value (impossible under Allow::ALL) rolls the member
+            // back so no dangling `key: ` remains.
+            let mark = self.separator_mark(idx);
+            if let Some(out) = self.emit() {
+                write_escaped(out, &key);
+                out.push_str(": ");
             }
-            // Stream: write the separator first; roll it back if the element
-            // does not materialize.
-            let mark = if let Some(out) = self.emit() {
-                let mark = out.len();
-                if !first {
-                    out.push_str(", ");
-                }
-                Some(mark)
-            } else {
-                None
-            };
-            match self.parse_value()? {
-                Some(value) => {
-                    if mark.is_none() {
-                        items.push(value);
-                    }
-                    self.frames[idx].first = false;
-                    self.frames[idx].comma_pending = false;
-                    self.save_cp(CpPhase::InContainer, false);
-                }
-                None => {
-                    if let (Some(out), Some(mark)) = (self.emit(), mark) {
-                        out.truncate(mark);
-                    }
-                    break;
-                }
+            if !self.parse_value()? {
+                self.rollback(mark);
+                break false;
             }
-        }
-        let keep = self.finish_collection(closed, Allow::ARR)?;
-        if let Some(out) = self.emit() {
-            debug_assert!(keep);
-            out.push(']');
-        }
-        if closed && self.streaming() {
-            self.save_cp(CpPhase::ContinueParent, true);
-        }
-        if keep {
-            if self.streaming() {
-                Ok(Some(Value::Null))
-            } else {
-                Ok(Some(Value::Array(items)))
+            if mark.is_none() {
+                let value = self.pop_value();
+                members.push((key.into_owned(), value));
             }
-        } else {
-            Ok(None)
-        }
+            // No checkpoint after a value: it may be a growable scalar.
+            self.member_done(idx);
+        };
+        self.close_container(closed, Allow::OBJ, '}', || Value::Object(members))
     }
 
-    /// Applies the truncation policy to a collection that never closed.
-    ///
-    /// Returns `true` when the caller should keep what it collected.
-    fn finish_collection(&self, closed: bool, flag: Allow) -> Result<bool, Error> {
-        if closed {
-            return Ok(true);
-        }
-        if !self.opts.repairs(Repairs::TRUNCATION) {
-            return Err(Error::new(ErrorKind::UnexpectedEnd, self.position()));
-        }
-        Ok(self.opts.allows(flag))
+    /// The element loop (see [`Self::run_object_loop`]; same resume rules).
+    fn run_array_loop(&mut self) -> Result<bool, Error> {
+        let idx = self.frames.len() - 1;
+        let mut items: Vec<Value> = Vec::new();
+        let closed = loop {
+            match self.separator_step(idx, false, Tag::CloseBracket)? {
+                Step::Again => continue,
+                Step::Closed => break true,
+                Step::End => break false,
+                Step::Member => {}
+            }
+            let mark = self.separator_mark(idx);
+            if !self.parse_value()? {
+                self.rollback(mark);
+                break false;
+            }
+            if mark.is_none() {
+                let value = self.pop_value();
+                items.push(value);
+            }
+            self.member_done(idx);
+        };
+        self.close_container(closed, Allow::ARR, ']', || Value::Array(items))
     }
+
+    /// Finishes a container: applies the truncation policy to one that
+    /// never closed, then renders the closer (stream) or pushes the node
+    /// (tree). A real closer is a stable boundary for the parent's value-arm
+    /// resume, even when it is the last input byte.
+    fn close_container(
+        &mut self,
+        closed: bool,
+        flag: Allow,
+        closer: char,
+        node: impl FnOnce() -> Value,
+    ) -> Result<bool, Error> {
+        let keep = closed || {
+            if !self.opts.repairs(Repairs::TRUNCATION) {
+                return Err(Error::new(ErrorKind::UnexpectedEnd, self.position()));
+            }
+            self.opts.allows(flag)
+        };
+        match self.out.as_deref_mut() {
+            Some(out) => {
+                // Stream mode only runs under Allow::ALL, where `keep` is
+                // always true — the closer is written once, whether the
+                // container closed explicitly or by truncation repair.
+                debug_assert!(keep);
+                out.push(closer);
+                if closed {
+                    self.save_cp(CpPhase::ContinueParent, true);
+                }
+            }
+            None if keep => self.values.push(node()),
+            None => {}
+        }
+        Ok(keep)
+    }
+}
+
+/// What [`Parser::separator_step`] found.
+enum Step {
+    /// A member/element should be parsed next.
+    Member,
+    /// A separator or noise token was consumed; look again.
+    Again,
+    /// The container's closer was consumed.
+    Closed,
+    /// End of input.
+    End,
 }
 
 /// Maximum structural nesting of `text` (brackets/braces outside strings).

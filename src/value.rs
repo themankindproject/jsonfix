@@ -1,5 +1,6 @@
 //! A dependency-free JSON value tree with lossless number handling.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -23,6 +24,12 @@ impl Number {
         &self.0
     }
 
+    /// The number text, by value.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
     /// Parses the number as `f64`.
     #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
@@ -40,6 +47,30 @@ impl Number {
     pub fn as_u64(&self) -> Option<u64> {
         self.0.parse().ok()
     }
+
+    /// The serde data-model reading of the text: an exact `i64`, else an
+    /// exact `u64`, else a finite `f64`; `None` when none fits (e.g. `1e400`).
+    #[cfg(feature = "serde")]
+    pub(crate) fn classify(&self) -> Option<Classified> {
+        if let Some(value) = self.as_i64() {
+            return Some(Classified::I64(value));
+        }
+        if let Some(value) = self.as_u64() {
+            return Some(Classified::U64(value));
+        }
+        self.as_f64()
+            .filter(|value| value.is_finite())
+            .map(Classified::F64)
+    }
+}
+
+/// See [`Number::classify`].
+#[cfg(feature = "serde")]
+#[derive(Clone, Copy)]
+pub(crate) enum Classified {
+    I64(i64),
+    U64(u64),
+    F64(f64),
 }
 
 impl fmt::Display for Number {
@@ -155,33 +186,11 @@ impl Value {
     /// run of digits indexes an array, so `/01` and `/-1` resolve to nothing.
     #[must_use]
     pub fn pointer(&self, pointer: &str) -> Option<&Value> {
-        if pointer.is_empty() {
-            return Some(self);
-        }
-        // RFC 6901: a non-empty pointer starts with `/`. Without this guard
-        // `pointer("users")` (a likely typo) would yield the root document.
-        if !pointer.starts_with('/') {
-            return None;
-        }
-        let mut current = self;
-        for raw in pointer.split('/').skip(1) {
-            // RFC 6901 escaping is rare; only allocate an unescaped copy when
-            // a `~` is actually present, otherwise index with the borrowed
-            // token directly (no allocation per segment).
-            let unescaped;
-            let token: &str = if raw.contains('~') {
-                unescaped = raw.replace("~1", "/").replace("~0", "~");
-                &unescaped
-            } else {
-                raw
-            };
-            current = match current {
-                Value::Object(_) => current.get(token)?,
-                Value::Array(items) => items.get(array_index(token)?)?,
-                _ => return None,
-            };
-        }
-        Some(current)
+        pointer_tokens(pointer)?.try_fold(self, |current, token| match current {
+            Value::Object(_) => current.get(&token),
+            Value::Array(items) => items.get(array_index(&token)?),
+            _ => None,
+        })
     }
 
     /// Mutable elements when this is a [`Value::Array`].
@@ -222,28 +231,11 @@ impl Value {
     /// ```
     #[must_use]
     pub fn pointer_mut(&mut self, pointer: &str) -> Option<&mut Value> {
-        if pointer.is_empty() {
-            return Some(self);
-        }
-        if !pointer.starts_with('/') {
-            return None;
-        }
-        let mut current = self;
-        for raw in pointer.split('/').skip(1) {
-            let unescaped;
-            let token: &str = if raw.contains('~') {
-                unescaped = raw.replace("~1", "/").replace("~0", "~");
-                &unescaped
-            } else {
-                raw
-            };
-            current = match current {
-                Value::Object(_) => current.get_mut(token)?,
-                Value::Array(items) => items.get_mut(array_index(token)?)?,
-                _ => return None,
-            };
-        }
-        Some(current)
+        pointer_tokens(pointer)?.try_fold(self, |current, token| match current {
+            Value::Object(_) => current.get_mut(&token),
+            Value::Array(items) => items.get_mut(array_index(&token)?),
+            _ => None,
+        })
     }
 
     /// Moves the value out, leaving [`Value::Null`] in its place.
@@ -577,11 +569,75 @@ macro_rules! from_integer {
 
 from_integer!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
 
+/// Floats render with Rust's shortest round-trip text (`0.1`, `1.0`,
+/// `1e300`); a non-finite float has no JSON spelling and becomes `null`, as
+/// in `serde_json`.
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        if value.is_finite() {
+            Value::Number(Number::from_normalized(alloc::format!("{value:?}")))
+        } else {
+            Value::Null
+        }
+    }
+}
+
+/// Widens to `f64` first (as `serde_json` does), so `Value::from(x) == x`
+/// holds under the `f64`-based float comparison.
+impl From<f32> for Value {
+    fn from(value: f32) -> Self {
+        Value::from(f64::from(value))
+    }
+}
+
+/// `None` converts to `null`.
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Value::Null, Into::into)
+    }
+}
+
 impl<T: Into<Value>> FromIterator<T> for Value {
     /// Collects into an array.
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         Value::Array(iter.into_iter().map(Into::into).collect())
     }
+}
+
+impl<K: Into<String>, V: Into<Value>> FromIterator<(K, V)> for Value {
+    /// Collects key/value pairs into an object, in order (duplicates kept).
+    ///
+    /// ```
+    /// use jsonfix::Value;
+    ///
+    /// let value: Value = [("a", 1), ("b", 2)].into_iter().collect();
+    /// assert_eq!(value.to_json_string(), r#"{"a": 1, "b": 2}"#);
+    /// ```
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        Value::Object(
+            iter.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        )
+    }
+}
+
+/// The unescaped reference tokens of an RFC 6901 pointer, or `None` for a
+/// non-empty pointer that does not start with `/` (without this guard
+/// `pointer("users")`, a likely typo, would yield the root document). The
+/// empty pointer has no tokens. Escaping is rare, so only a token that
+/// actually contains `~` allocates an unescaped copy.
+fn pointer_tokens(pointer: &str) -> Option<impl Iterator<Item = Cow<'_, str>>> {
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return None;
+    }
+    Some(pointer.split('/').skip(1).map(|raw| {
+        if raw.contains('~') {
+            Cow::Owned(raw.replace("~1", "/").replace("~0", "~"))
+        } else {
+            Cow::Borrowed(raw)
+        }
+    }))
 }
 
 /// Parses an RFC 6901 array-index reference token.
@@ -601,23 +657,25 @@ fn array_index(token: &str) -> Option<usize> {
 
 /// Writes `text` as a JSON string, escaping the minimum the grammar requires.
 pub(crate) fn write_escaped(out: &mut String, text: &str) {
+    use crate::swar::{broadcast, less_lanes, load_word, zero_lanes};
     out.push('"');
     let bytes = text.as_bytes();
-    let n_quote = crate::swar::broadcast(b'"');
-    let n_backslash = crate::swar::broadcast(b'\\');
-    let n_control = crate::swar::broadcast(0x20);
+    let n_quote = broadcast(b'"');
+    let n_backslash = broadcast(b'\\');
+    let n_control = broadcast(0x20);
     let mut plain_start = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         // SWAR stride: skip 8 bytes at a time while none needs escaping
-        // (`"`, `\`, or a C0 control). The scalar scan below then finds the
-        // exact byte — SWAR only ever advances over proven-clean bytes.
+        // (`"`, `\`, or a C0 control) — one branch for all three classes.
+        // The scalar scan below then finds the exact byte; SWAR only ever
+        // advances over proven-clean bytes.
         while i + 8 <= bytes.len() {
-            let word = crate::swar::load_word(bytes, i);
-            if crate::swar::hasbyte(word, n_quote)
-                || crate::swar::hasbyte(word, n_backslash)
-                || crate::swar::hasless(word, n_control)
-            {
+            let word = load_word(bytes, i);
+            let stop = zero_lanes(word ^ n_quote)
+                | zero_lanes(word ^ n_backslash)
+                | less_lanes(word, n_control);
+            if stop != 0 {
                 break;
             }
             i += 8;

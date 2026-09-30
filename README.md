@@ -284,6 +284,9 @@ assert_eq!(
     1234567890123456789u64
 );
 assert_eq!(Value::from_serde_json(&serde_json::json!({"a": 1})).to_json_string(), r#"{"a": 1}"#);
+// Consuming `From` in both directions moves strings instead of cloning them.
+let moved = serde_json::Value::from(jsonfix::parse("{name: 'Ada'}").unwrap());
+assert_eq!(Value::from(moved)["name"], "Ada");
 ```
 
 ## Byte and writer APIs
@@ -357,6 +360,9 @@ reply.get_mut("tags").and_then(Value::as_array_mut).unwrap().push(Value::from("b
 assert_eq!(reply.to_json_string(), r#"{"id": 8, "tags": ["a", "b"]}"#);
 let tags = reply.get_mut("tags").unwrap().take(); // moved out, `null` left behind
 assert_eq!(tags, ["a", "b"].into_iter().collect::<Value>());
+// Pairs collect into an object; floats keep their text, NaN has none (`null`).
+let point: Value = [("x", 1.5), ("y", f64::NAN)].into_iter().collect();
+assert_eq!(point.to_json_string(), r#"{"x": 1.5, "y": null}"#);
 
 // Stream state: raw input, repaired output, byte count.
 let mut stream = StreamRepairer::new();
@@ -401,8 +407,8 @@ public; `ErrorKind`, `WriteError`, and `DeserializeError` are
 
 | Type | Shape | Methods / fields |
 |---|---|---|
-| `Value` | `Null`, `Bool`, `Number`, `String`, `Array(Vec<Value>)`, `Object(Vec<(String, Value)>)` | `as_str`, `as_bool`, `as_number`, `as_f64`, `as_i64`, `as_u64`, `as_array`, `as_object`, `get`, `index`, `pointer`, `as_array_mut`, `as_object_mut`, `get_mut`, `pointer_mut`, `take`, `len`, `is_null`, `is_bool`, `is_number`, `is_string`, `is_array`, `is_object`, `is_empty`, `write_to`, `to_json_string`, `to_serde_json` / `from_serde_json` *(serde_json)*; `v["key"]` / `v[0]` (never panic, `null` when absent); `==` against `str`/`String`/`bool`/integers/floats; `From` bool, strings, integers, `()`, `Vec`s; `FromIterator` |
-| `Number` | the original digit text | `as_str`, `as_f64`, `as_i64`, `as_u64` |
+| `Value` | `Null`, `Bool`, `Number`, `String`, `Array(Vec<Value>)`, `Object(Vec<(String, Value)>)` | `as_str`, `as_bool`, `as_number`, `as_f64`, `as_i64`, `as_u64`, `as_array`, `as_object`, `get`, `index`, `pointer`, `as_array_mut`, `as_object_mut`, `get_mut`, `pointer_mut`, `take`, `len`, `is_null`, `is_bool`, `is_number`, `is_string`, `is_array`, `is_object`, `is_empty`, `write_to`, `to_json_string`, `to_serde_json` / `from_serde_json` and consuming `From` both ways *(serde_json)*; `v["key"]` / `v[0]` (never panic, `null` when absent); `==` against `str`/`String`/`bool`/integers/floats; `From` bool, strings, integers, floats (non-finite → `null`), `Option` (`None` → `null`), `()`, `Vec`s; `FromIterator` of values (array) or `(key, value)` pairs (object) |
+| `Number` | the original digit text | `as_str`, `into_string`, `as_f64`, `as_i64`, `as_u64` |
 | `Options` | `allow: Allow`, `repairs: Repairs` | `all`, `strict`, `partial`, `with_repairs`, `with_allow`, `repairs`, `allows` |
 | `Allow` | `NOTHING`/`NONE`, `STR`, `NUM`, `ARR`, `OBJ`, `KEY`, `BOOL`, `NULL`, `ATOM`, `COLLECTION`, `ALL` | `contains`, `is_empty`, `bits`, `union`, `without`, `BitOr` |
 | `Repairs` | `NONE`, `FENCES`, `COMMENTS`, `UNQUOTED`, `KEYWORDS`, `NUMBERS`, `CONCATENATION`, `CALLS`, `ENTITIES`, `QUOTES`, `WHITESPACE`, `TRUNCATION`, `NDJSON`, `ALL` | `contains`, `bits`, `union`, `without`, `BitOr` |
@@ -440,13 +446,16 @@ jsonfix-benchmarks --bench repair`):
 
 | Operation | Time | Throughput |
 |---|---|---|
-| `repair` | ~276–283 μs | ~44–46 MiB/s |
-| `repair_extract` | ~282–290 μs | ~43–45 MiB/s |
+| `repair` | ~194–207 μs | ~61–65 MiB/s |
+| `repair_extract` | ~206–211 μs | ~60–61 MiB/s |
 
-For context on the same machine, `validate` costs about the same as `repair`,
-and both are ≈2× a native `serde_json::from_str` on the repaired output
-(~190 μs). Numbers are single-machine criterion medians and move with the
-machine; the ratios are the claim.
+For context on the same machine, `repair` streams its output without building
+a tree and runs about 1.15× a native `serde_json::from_str::<serde_json::Value>`
+of the repaired output; `validate`/`parse` build a `Value` tree and cost about
+1.35× `repair`. Streaming is linear in total input: a 51 KB object pushed in
+8-byte chunks renders in ~3.2 ms with `push` and ~3.4 ms with `push_delta`
+(`--bench stream`). Numbers are single-machine criterion medians and move with
+the machine; the ratios are the claim.
 
 ## No standard library required
 

@@ -290,3 +290,92 @@ fn fuzz_crash_two_pass_string_comma_is_not_stable() {
         start = end;
     }
 }
+
+#[test]
+fn double_escape_verdict_flip_does_not_resume_a_stale_checkpoint() {
+    // Regression: `[\n1, ` checkpoints after its comma; `\"a\", ` flips the
+    // double-escape verdict on (the render becomes the unescaped document,
+    // recorded without checkpoints); the raw `"` of `"b"]` flips it back
+    // off. The pre-flip checkpoint must not survive the unescaped render,
+    // or the resume splices a raw tail onto the unescaped prefix
+    // (`[1, "a", "a\"", "b"]`).
+    let chunks = ["[\\n1, ", "\\\"a\\\", ", "\"b\"]"];
+    let mut stream = StreamRepairer::new();
+    let mut delta_stream = StreamRepairer::new();
+    let mut shown = String::new();
+    let mut acc = String::new();
+    for chunk in chunks {
+        acc.push_str(chunk);
+        let want = jsonfix::repair(&acc).expect("prefix repairs");
+        assert_eq!(stream.push(chunk).expect("push"), want, "push at {acc:?}");
+        let delta = delta_stream.push_delta(chunk).expect("push_delta");
+        shown.truncate(delta.keep);
+        shown.push_str(delta.text);
+        assert_eq!(shown, want, "push_delta at {acc:?}");
+    }
+}
+
+/// Naive reference for `Delta::keep`: the longest shared prefix, rounded down
+/// to a character boundary of the new output.
+fn longest_shared_prefix(old: &str, new: &str) -> usize {
+    let mut len = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !new.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
+#[test]
+fn push_delta_keep_is_the_longest_shared_prefix() {
+    // Resumed deltas only compare the tail past the checkpoint; these
+    // documents cover the cases where that shortcut must still be exact:
+    // ordinary appends, the NDJSON `[` retrofit (including a first value that
+    // itself starts with `[`, where old and new share bytes across the
+    // shift), multi-byte text at the diff boundary, and repairs that rewrite
+    // earlier output.
+    let documents = [
+        "{\"a\": 1, \"b\": [1, 2, 3], \"c\": \"text\", \"d\": {\"e\": null}}",
+        "[1]\n[2]\n[3, [4]]\n{\"x\": [[5]]}",
+        "[[[1]]]\n[[2]]\n3",
+        "{\"k\": 1}\n{\"k\": 2}\n{\"k\": 3}\n",
+        "{\"é\": \"日本語\", \"ü\": [\"ß\", \"€€\"], \"n\": 1.5}",
+        "{a: 'single', b: True, c: None, d: [1, 2,], /* c */ e: \"x\" + \"y\"}",
+        "{\"s\": \"a,b\", \"t\": \"c]d\", \"u\": \"unterminated",
+    ];
+    for doc in documents {
+        for step in 1..=9 {
+            let mut stream = StreamRepairer::new();
+            let mut reference = StreamRepairer::new();
+            let mut shown = String::new();
+            let mut start = 0;
+            while start < doc.len() {
+                let mut end = (start + step).min(doc.len());
+                while !doc.is_char_boundary(end) {
+                    end += 1;
+                }
+                let chunk = &doc[start..end];
+                let before = String::from(reference.output());
+                let want = reference.push(chunk).map(String::from);
+                match (stream.push_delta(chunk), want) {
+                    (Ok(delta), Ok(want)) => {
+                        let expected_keep = longest_shared_prefix(&before, &want);
+                        assert_eq!(
+                            delta.keep, expected_keep,
+                            "keep not maximal for {doc:?} (step {step}, byte {end})"
+                        );
+                        shown.truncate(delta.keep);
+                        shown.push_str(delta.text);
+                        assert_eq!(shown, want, "delta diverged for {doc:?} (step {step})");
+                    }
+                    (Err(got), Err(want)) => assert_eq!(got.kind(), want.kind()),
+                    (got, want) => panic!("push_delta {got:?} vs push {want:?} for {doc:?}"),
+                }
+                start = end;
+            }
+        }
+    }
+}

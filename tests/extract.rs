@@ -71,3 +71,30 @@ fn extracted_values_are_repairable() {
         "{\"user\": \"ada\", \"ok\": true}"
     );
 }
+
+#[test]
+fn extract_all_prefers_brackets_and_falls_back_to_scalars() {
+    // Scalars before the first bracket are skipped (brackets win), and once
+    // no bracket remains, bare scalars are collected in order.
+    assert_eq!(
+        extract_all("n=1 {\"a\": 2} m=3 [4] tail 5 and 6"),
+        vec!["{\"a\": 2}", "[4]", "5", "6"]
+    );
+}
+
+#[test]
+fn extract_all_is_linear_in_bracketless_prose() {
+    // Regression: every value used to rescan the rest of the input for a
+    // bracket, which is quadratic in prose full of bare numbers (16k values
+    // took seconds). The bracket search is now cached across values.
+    let mut doc = String::new();
+    for i in 0..20_000 {
+        doc.push_str("count=");
+        doc.push_str(&i.to_string());
+        doc.push(' ');
+    }
+    let values = extract_all(&doc);
+    assert_eq!(values.len(), 20_000);
+    assert_eq!(values[0], "0");
+    assert_eq!(values[19_999], "19999");
+}

@@ -4,9 +4,9 @@ use alloc::borrow::Cow;
 use alloc::string::String;
 
 use crate::chars::{
-    decode_html_entity, hex_value, is_delimiter, is_double_quote, is_func_name_char, is_json_ws,
-    is_quote, is_single_quote, is_special_ws, is_unquoted_delimiter, is_url_char, is_url_scheme,
-    is_ws,
+    decode_html_entity, hex_value, is_delimiter, is_double_quote, is_func_name_char, is_quote,
+    is_single_quote, is_special_ws, is_unquoted_delimiter, is_url_char, is_url_scheme, is_ws,
+    simple_escape,
 };
 use crate::error::{Error, ErrorKind};
 use crate::options::{Allow, Options, Repairs};
@@ -69,6 +69,20 @@ enum QuoteFamily {
 }
 
 impl Opener {
+    /// An opener for the quote character `ch` spanning `len` source bytes.
+    fn new(ch: char, len: usize) -> Self {
+        Self {
+            ch,
+            len,
+            from_entity: false,
+            family: if is_single_quote(ch) {
+                QuoteFamily::Single
+            } else {
+                QuoteFamily::Double
+            },
+        }
+    }
+
     /// Whether `c` closes a string opened by this opener.
     fn is_end(&self, c: char) -> bool {
         match (self.family, self.ch) {
@@ -82,6 +96,7 @@ impl Opener {
 
 /// The tolerant lexer. Every method takes `&self` options so callers can run
 /// repair passes selectively.
+#[derive(Clone, Copy)]
 pub(crate) struct Lexer<'a> {
     src: &'a str,
     pos: usize,
@@ -153,13 +168,8 @@ impl<'a> Lexer<'a> {
     /// caching a token that was lexed in value context when the next token
     /// is really an object key (`key_position` would be wrong).
     pub(crate) fn peek_significant_char(&self) -> Option<char> {
-        let mut probe = Lexer {
-            src: self.src,
-            pos: self.pos,
-            opts: self.opts,
-            in_container: self.in_container,
-        };
-        let _ = probe.skip_trivia();
+        let mut probe = *self;
+        probe.skip_trivia();
         probe.peek_char()
     }
 
@@ -168,12 +178,17 @@ impl<'a> Lexer<'a> {
         &self.src[self.pos..]
     }
 
+    /// The next character. ASCII (nearly every byte of real JSON) is read
+    /// straight from the byte, skipping the slice and UTF-8 decode.
     fn peek_char(&self) -> Option<char> {
-        self.src[self.pos..].chars().next()
+        match *self.src.as_bytes().get(self.pos)? {
+            byte if byte.is_ascii() => Some(char::from(byte)),
+            _ => self.rest().chars().next(),
+        }
     }
 
     fn peek_second(&self) -> Option<char> {
-        self.src[self.pos..].chars().nth(1)
+        self.rest().chars().nth(1)
     }
 
     fn bump_char(&mut self) -> Option<char> {
@@ -187,57 +202,34 @@ impl<'a> Lexer<'a> {
     /// `key_position` makes a bare word stop at `:` so that `{a: 1}` lexes the
     /// key and its value separately.
     pub(crate) fn next_token(&mut self, key_position: bool) -> Result<Option<Spanned<'a>>, Error> {
-        let newline_before = self.skip_trivia()?;
+        let newline_before = self.skip_trivia();
         let start = self.pos;
         let Some(c) = self.peek_char() else {
             return Ok(None);
         };
-        let token = match c {
-            '{' => {
-                self.bump_char();
-                Token::OpenBrace
-            }
-            '}' => {
-                self.bump_char();
-                Token::CloseBrace
-            }
-            '[' => {
-                self.bump_char();
-                Token::OpenBracket
-            }
-            ']' => {
-                self.bump_char();
-                Token::CloseBracket
-            }
-            ':' => {
-                self.bump_char();
-                Token::Colon
-            }
-            ',' => {
-                self.bump_char();
-                Token::Comma
-            }
-            ';' => {
-                self.bump_char();
-                Token::Semicolon
-            }
-            '+' => {
-                self.bump_char();
-                Token::Plus
-            }
-            '(' => {
-                self.bump_char();
-                Token::OpenParen
-            }
-            ')' => {
-                self.bump_char();
-                Token::CloseParen
-            }
+        let token = if let Some(token) = punctuator(c) {
+            self.pos += 1;
+            token
+        } else {
+            self.scan_token(c, key_position)?
+        };
+        Ok(Some(Spanned {
+            token,
+            start,
+            newline_before,
+        }))
+    }
+
+    /// Lexes a token that is not a single-byte punctuator; `c` is the
+    /// character at the cursor.
+    fn scan_token(&mut self, c: char, key_position: bool) -> Result<Token<'a>, Error> {
+        let start = self.pos;
+        Ok(match c {
             '.' if self.rest().starts_with("...") => {
                 self.pos += 3;
                 self.skip_ws_only();
                 if self.peek_char() == Some(',') {
-                    self.bump_char();
+                    self.pos += 1;
                 }
                 Token::Ellipsis
             }
@@ -254,9 +246,11 @@ impl<'a> Lexer<'a> {
             }
             '\\' if self.opts.repairs(Repairs::UNQUOTED) => {
                 // A redundant escape before a quote, as in `{\"a\": 1}`.
-                self.bump_char();
+                self.pos += 1;
                 match self.peek_char() {
-                    Some(q) if is_quote(q) => self.scan_string()?,
+                    Some(q) if is_quote(q) => {
+                        self.scan_string_from(Opener::new(q, q.len_utf8()))?
+                    }
                     _ => {
                         self.pos = start;
                         self.scan_word(key_position)
@@ -266,10 +260,8 @@ impl<'a> Lexer<'a> {
             '&' => match decode_html_entity(self.rest()) {
                 Some((ch, len)) if is_quote(ch) && self.opts.repairs(Repairs::ENTITIES) => self
                     .scan_string_from(Opener {
-                        ch,
-                        len,
                         from_entity: true,
-                        family: quote_family(ch),
+                        ..Opener::new(ch, len)
                     })?,
                 _ => self.scan_number_or_word(key_position)?,
             },
@@ -277,22 +269,29 @@ impl<'a> Lexer<'a> {
                 if c != '"' && !self.opts.repairs(Repairs::QUOTES) {
                     return Err(Error::new(ErrorKind::UnexpectedCharacter(c), start));
                 }
-                self.scan_string_from(Opener {
-                    ch: c,
-                    len: c.len_utf8(),
-                    from_entity: false,
-                    family: quote_family(c),
-                })?
+                self.scan_string_from(Opener::new(c, c.len_utf8()))?
             }
             '-' | '0'..='9' | '.' => self.scan_number_or_word(key_position)?,
             _ => self.scan_word(key_position),
-        };
-        Ok(Some(Spanned {
-            token,
-            start,
-            newline_before,
-        }))
+        })
     }
+}
+
+/// The token for a single-byte punctuator, or `None`.
+fn punctuator(c: char) -> Option<Token<'static>> {
+    Some(match c {
+        '{' => Token::OpenBrace,
+        '}' => Token::CloseBrace,
+        '[' => Token::OpenBracket,
+        ']' => Token::CloseBracket,
+        ':' => Token::Colon,
+        ',' => Token::Comma,
+        ';' => Token::Semicolon,
+        '+' => Token::Plus,
+        '(' => Token::OpenParen,
+        ')' => Token::CloseParen,
+        _ => return None,
+    })
 }
 
 impl<'a> Lexer<'a> {
@@ -300,23 +299,25 @@ impl<'a> Lexer<'a> {
     ///
     /// Returns whether a newline was skipped, which is what separates NDJSON
     /// records at the top level.
-    fn skip_trivia(&mut self) -> Result<bool, Error> {
+    fn skip_trivia(&mut self) -> bool {
         let mut saw_newline = false;
         loop {
-            // Fast reject: classify the next byte before doing any
-            // whitespace/comment/fence work. Most token boundaries that have
-            // trivia start with a known trivia byte; everything else (JSON
-            // punctuators, quotes, digits, letters) returns immediately —
-            // this runs once per token (~thousands per document).
+            // Fast reject: classify the next byte (and, for `/`/`[`/`{`, the
+            // one after it) before doing any whitespace/comment/fence work.
+            // Everything else (JSON punctuators, quotes, digits, letters)
+            // returns immediately — this runs once per token.
             let bytes = self.src.as_bytes();
+            let next = bytes.get(self.pos + 1).copied();
             let can_start_trivia = match bytes.get(self.pos) {
                 None => false,
                 Some(&b) => match b {
                     b' ' | b'\n' | b'\r' | b'\t' => true,
-                    b'/' => self.opts.repairs(Repairs::COMMENTS),
-                    // `[``` / `{``` fence openers and ``` fences: only probe
-                    // further when the byte could actually begin one.
-                    b'`' | b'[' | b'{' => self.opts.repairs(Repairs::FENCES),
+                    b'/' => {
+                        self.opts.repairs(Repairs::COMMENTS) && matches!(next, Some(b'/' | b'*'))
+                    }
+                    b'`' => self.opts.repairs(Repairs::FENCES),
+                    // `[```` / `{```` fence openers: only when a backtick follows.
+                    b'[' | b'{' => self.opts.repairs(Repairs::FENCES) && next == Some(b'`'),
                     // Special Unicode whitespace lives in multi-byte space;
                     // real non-ASCII tokens fall through to the loop, which
                     // consumes nothing and returns.
@@ -324,60 +325,62 @@ impl<'a> Lexer<'a> {
                 },
             };
             if !can_start_trivia {
-                return Ok(saw_newline);
+                return saw_newline;
             }
             let before = self.pos;
             saw_newline |= self.skip_ws_only();
             if self.opts.repairs(Repairs::COMMENTS) {
-                if self.rest().starts_with("//") {
-                    while let Some(c) = self.peek_char() {
-                        if c == '\n' {
-                            break;
-                        }
-                        self.bump_char();
-                    }
-                } else if self.rest().starts_with("/*") {
-                    self.pos += 2;
-                    while !self.at_end() && !self.rest().starts_with("*/") {
-                        saw_newline |= self.peek_char() == Some('\n');
-                        self.bump_char();
-                    }
-                    if self.rest().starts_with("*/") {
-                        self.pos += 2;
-                    }
-                }
+                saw_newline |= self.skip_comment();
             }
             if self.opts.repairs(Repairs::FENCES) {
-                // The reference also treats `[``` ` / `{``` ` as fence
-                // openers and ` ```] ` / ` ```} ` as fence closers, so a
-                // bracket wrapped around a fence disappears with it
-                // (`[```\n{"a":1}\n```]` → `{"a": 1}`). A `[`/`{` only
-                // counts when a backtick follows — cheap pre-check that
-                // skips the string compares for ordinary JSON brackets.
-                if matches!(bytes.get(self.pos), Some(b'[' | b'{'))
-                    && bytes.get(self.pos + 1) == Some(&b'`')
-                    && (self.rest().starts_with("[```") || self.rest().starts_with("{```"))
-                {
-                    self.pos += 1;
-                }
-                if self.rest().starts_with("```") {
-                    self.pos += 3;
-                    // Optional language specifier. Only whitespace after it
-                    // is consumed — the content stays for the parser, so
-                    // inline fences like ```{"a":1}``` work as well as line
-                    // fences (reference: skipMarkdownCodeBlock eats ``` +
-                    // lang + ws).
-                    while matches!(self.peek_char(), Some(c) if is_func_name_char(c)) {
-                        self.bump_char();
-                    }
-                    if matches!(self.peek_char(), Some(']' | '}')) {
-                        self.bump_char();
-                    }
-                }
+                self.skip_fence();
             }
             if self.pos == before {
-                return Ok(saw_newline);
+                return saw_newline;
             }
+        }
+    }
+
+    /// Skips one `//` comment (up to, not including, its newline) or one
+    /// `/* */` comment at the cursor; returns whether a block comment spanned
+    /// a newline. An unterminated block comment runs to the end of input.
+    fn skip_comment(&mut self) -> bool {
+        if self.src.as_bytes().get(self.pos) != Some(&b'/') {
+            return false;
+        }
+        let rest = self.rest();
+        if rest.starts_with("//") {
+            self.pos += rest.find('\n').unwrap_or(rest.len());
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            let (body, closer) = match body.find("*/") {
+                Some(end) => (&body[..end], 2),
+                None => (body, 0),
+            };
+            self.pos += 2 + body.len() + closer;
+            return body.contains('\n');
+        }
+        false
+    }
+
+    /// Skips a markdown fence at the cursor: ```` ``` ```` plus an optional
+    /// language specifier. Only the marker is consumed — the content stays
+    /// for the parser, so inline fences like ```` ```{"a":1}``` ```` work as
+    /// well as line fences (reference: `skipMarkdownCodeBlock`). The
+    /// reference also treats `[```` / `{```` as openers and ```` ```] ```` /
+    /// ```` ```} ```` as closers, so a bracket wrapped around a fence
+    /// disappears with it (`[```\n{"a":1}\n```]` → `{"a": 1}`).
+    fn skip_fence(&mut self) {
+        let rest = &self.src.as_bytes()[self.pos..];
+        let bracket = usize::from(matches!(rest, [b'[' | b'{', b'`', b'`', b'`', ..]));
+        if !rest[bracket..].starts_with(b"```") {
+            return;
+        }
+        self.pos += bracket + 3;
+        while matches!(self.peek_char(), Some(c) if is_func_name_char(c)) {
+            self.pos += 1;
+        }
+        if matches!(self.peek_char(), Some(']' | '}')) {
+            self.pos += 1;
         }
     }
 
@@ -414,22 +417,6 @@ impl<'a> Lexer<'a> {
         saw_newline
     }
 
-    /// Scans a string that starts at the current quote character.
-    fn scan_string(&mut self) -> Result<Token<'a>, Error> {
-        let Some(c) = self.peek_char() else {
-            return Err(Error::new(ErrorKind::UnexpectedEnd, self.pos));
-        };
-        if !is_quote(c) {
-            return Err(Error::new(ErrorKind::UnexpectedCharacter(c), self.pos));
-        }
-        self.scan_string_from(Opener {
-            ch: c,
-            len: c.len_utf8(),
-            from_entity: false,
-            family: quote_family(c),
-        })
-    }
-
     /// Scans a string opened by `opener`, normalizing quotes and escapes.
     ///
     /// Content that arrives verbatim from the input (bulk ASCII runs, kept
@@ -439,8 +426,34 @@ impl<'a> Lexer<'a> {
     fn scan_string_from(&mut self, opener: Opener) -> Result<Token<'a>, Error> {
         self.pos += opener.len;
         let start = self.pos;
+        let end_byte = match opener.family {
+            QuoteFamily::Double => b'"',
+            QuoteFamily::Single => b'\'',
+        };
+        // Fast path: clean content closed by the family's ASCII quote and
+        // followed directly by a byte the end-quote rules always accept
+        // (`,`/`:`/newline anywhere, a closer inside a container) — exactly
+        // what the general loop below concludes, minus its bookkeeping.
+        let bytes = self.src.as_bytes();
+        let run_end = plain_run_end(bytes, start, end_byte);
+        if !opener.from_entity && bytes.get(run_end) == Some(&end_byte) {
+            let accept = match bytes.get(run_end + 1) {
+                Some(b',' | b':' | b'\n') => true,
+                Some(b'}' | b']') => self.in_container,
+                _ => false,
+            };
+            if accept {
+                self.pos = run_end + 1;
+                return Ok(Token::Str {
+                    text: Cow::Borrowed(&self.src[start..run_end]),
+                    truncated: false,
+                });
+            }
+        }
+        // The general loop resumes after the run already scanned above.
+        self.pos = run_end;
         // End of the verbatim prefix while `owned` is still `None`.
-        let mut content_end = start;
+        let mut content_end = run_end;
         let mut owned: Option<String> = None;
         let mut truncated = false;
         let mut stop_at_delimiter = false;
@@ -448,50 +461,32 @@ impl<'a> Lexer<'a> {
         // Whether the last pushed char came raw from the input and is a
         // delimiter (only then can the EOF two-pass rule fire — an escaped
         // `\]` is legitimate string content, not a swallowed closer).
-        let mut raw_delim_tail = false;
+        let mut raw_delim_tail = run_end > start && is_delimiter(char::from(bytes[run_end - 1]));
         loop {
             // Fast path: advance over a run of plain ASCII content (no escape,
             // no quote, no entity `&`, no non-ASCII). While nothing has been
             // decoded the run needs no buffer at all; afterwards it is one
-            // memcpy into the owned buffer. Long runs are skipped in 8-byte
-            // SWAR strides; the precise scalar scan still decides the exact
-            // stop byte (and the stop-mode delimiter set).
+            // memcpy into the owned buffer. Stop-mode runs are short by
+            // definition (they end at the first delimiter), so they skip the
+            // SWAR strides and also stop at unquoted-string delimiters.
             {
                 let bytes = self.src.as_bytes();
-                let end_byte = match opener.family {
-                    QuoteFamily::Double => b'"',
-                    QuoteFamily::Single => b'\'',
-                };
                 let mut i = self.pos;
-                if !stop_at_delimiter {
-                    // Stop set for ordinary strings: `&`, `\`, the family's
-                    // ASCII quote, or any non-ASCII (typographic quotes).
-                    // Stop-mode runs are short by definition (they end at the
-                    // first delimiter), so SWAR is skipped there.
-                    let n_amp = crate::swar::broadcast(b'&');
-                    let n_bs = crate::swar::broadcast(b'\\');
-                    let n_end = crate::swar::broadcast(end_byte);
-                    while i + 8 <= bytes.len() {
-                        let word = crate::swar::load_word(bytes, i);
-                        if crate::swar::hasbyte(word, n_amp)
-                            || crate::swar::hasbyte(word, n_bs)
-                            || crate::swar::hasbyte(word, n_end)
-                            || crate::swar::has_non_ascii(word)
+                if stop_at_delimiter {
+                    while i < bytes.len() {
+                        let b = bytes[i];
+                        if b >= 0x80
+                            || b == b'&'
+                            || b == b'\\'
+                            || b == end_byte
+                            || is_unquoted_delimiter(char::from(b))
                         {
                             break;
                         }
-                        i += 8;
+                        i += 1;
                     }
-                }
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    if b >= 0x80 || b == b'&' || b == b'\\' || b == end_byte {
-                        break;
-                    }
-                    if stop_at_delimiter && is_unquoted_delimiter(b as char) {
-                        break;
-                    }
-                    i += 1;
+                } else {
+                    i = plain_run_end(bytes, i, end_byte);
                 }
                 if let Some(stop) = stop_at_index {
                     if stop <= i {
@@ -750,43 +745,53 @@ impl<'a> Lexer<'a> {
         loop {
             let before = self.pos;
             while let Some(c) = self.peek_char() {
-                if c == '\n' {
+                let skip = match c {
+                    ' ' | '\r' | '\t' => true,
+                    '\n' => false,
+                    c => is_special_ws(c) && self.opts.repairs(Repairs::WHITESPACE),
+                };
+                if !skip {
                     break;
                 }
-                if is_json_ws(c) {
-                    self.bump_char();
-                } else if is_special_ws(c) {
-                    if !self.opts.repairs(Repairs::WHITESPACE) {
-                        break;
-                    }
-                    self.bump_char();
-                } else {
-                    break;
-                }
+                self.pos += c.len_utf8();
             }
             if self.opts.repairs(Repairs::COMMENTS) {
-                if self.rest().starts_with("//") {
-                    while let Some(c) = self.peek_char() {
-                        if c == '\n' {
-                            break;
-                        }
-                        self.bump_char();
-                    }
-                } else if self.rest().starts_with("/*") {
-                    self.pos += 2;
-                    while !self.at_end() && !self.rest().starts_with("*/") {
-                        self.bump_char();
-                    }
-                    if self.rest().starts_with("*/") {
-                        self.pos += 2;
-                    }
-                }
+                self.skip_comment();
             }
             if self.pos == before {
                 break;
             }
         }
     }
+}
+
+/// End of the run of plain string content starting at `i`: the first `&`,
+/// `\`, `end_byte` (the family's ASCII quote), or non-ASCII byte (typographic
+/// quotes), else the end of input. Long runs advance in 8-byte SWAR strides;
+/// the scalar tail decides the exact stop byte.
+fn plain_run_end(bytes: &[u8], mut i: usize, end_byte: u8) -> usize {
+    use crate::swar::{broadcast, load_word, non_ascii_lanes, zero_lanes};
+    let (amp, backslash, end) = (broadcast(b'&'), broadcast(b'\\'), broadcast(end_byte));
+    while i + 8 <= bytes.len() {
+        let word = load_word(bytes, i);
+        // One branch for all four stop classes (see `zero_lanes`).
+        let stop = zero_lanes(word ^ amp)
+            | zero_lanes(word ^ backslash)
+            | zero_lanes(word ^ end)
+            | non_ascii_lanes(word);
+        if stop != 0 {
+            break;
+        }
+        i += 8;
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b >= 0x80 || b == b'&' || b == b'\\' || b == end_byte {
+            break;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Whether `content` contains more opening than closing copies of the
@@ -813,14 +818,6 @@ fn escaped_at(src: &str, idx: usize) -> bool {
         == 1
 }
 
-fn quote_family(c: char) -> QuoteFamily {
-    if c == '\'' || is_single_quote(c) {
-        QuoteFamily::Single
-    } else {
-        QuoteFamily::Double
-    }
-}
-
 impl Lexer<'_> {
     /// Whether every repair pass is disabled.
     fn strict(&self) -> bool {
@@ -838,16 +835,11 @@ impl Lexer<'_> {
             // close the string.
             return Ok(false);
         };
+        if let Some(decoded) = simple_escape(c) {
+            text.push(decoded);
+            return Ok(false);
+        }
         match c {
-            '"' => text.push('"'),
-            '\\' => text.push('\\'),
-            '/' => text.push('/'),
-            'b' => text.push('\u{08}'),
-            'f' => text.push('\u{0C}'),
-            'n' => text.push('\n'),
-            'r' => text.push('\r'),
-            't' => text.push('\t'),
-            '\'' => text.push('\''),
             'u' => return self.read_unicode_escape(text),
             'x' => {
                 let hi = self.peek_char().and_then(hex_value);

@@ -10,7 +10,7 @@ use serde::de::{
 };
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
-use crate::value::{Number, Value};
+use crate::value::{Classified, Number, Value};
 
 impl Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -20,24 +20,15 @@ impl Serialize for Value {
         match self {
             Value::Null => serializer.serialize_unit(),
             Value::Bool(value) => serializer.serialize_bool(*value),
-            Value::Number(number) => {
-                let text = number.as_str();
-                if let Ok(value) = text.parse::<i64>() {
-                    return serializer.serialize_i64(value);
-                }
-                if let Ok(value) = text.parse::<u64>() {
-                    return serializer.serialize_u64(value);
-                }
-                match number.as_f64() {
-                    Some(value) if value.is_finite() => serializer.serialize_f64(value),
-                    // Never retype a number: JSON serializers turn non-finite
-                    // floats into `null` (serde_json) or would need a string
-                    // fallback — both silently change the type. Error instead.
-                    _ => Err(<S::Error as serde::ser::Error>::custom(alloc::format!(
-                        "number `{text}` is not a finite float and cannot be represented"
-                    ))),
-                }
-            }
+            Value::Number(number) => match number.classify() {
+                Some(Classified::I64(value)) => serializer.serialize_i64(value),
+                Some(Classified::U64(value)) => serializer.serialize_u64(value),
+                Some(Classified::F64(value)) => serializer.serialize_f64(value),
+                // Never retype a number: JSON serializers turn non-finite
+                // floats into `null` (serde_json) or would need a string
+                // fallback — both silently change the type. Error instead.
+                None => Err(<S::Error as serde::ser::Error>::custom(non_finite(number))),
+            },
             Value::String(text) => serializer.serialize_str(text),
             Value::Array(items) => {
                 let mut seq = serializer.serialize_seq(Some(items.len()))?;
@@ -91,8 +82,18 @@ impl<'de> Visitor<'de> for ValueVisitor {
         Ok(number(value.to_string()))
     }
 
-    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+    fn visit_i128<E>(self, value: i128) -> Result<Value, E> {
         Ok(number(value.to_string()))
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Value, E> {
+        Ok(number(value.to_string()))
+    }
+
+    /// Shortest round-trip text; a non-finite float (which has no JSON
+    /// spelling) becomes `null`, as in `serde_json`.
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(Value::from(value))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Value, E> {
@@ -229,9 +230,7 @@ macro_rules! parse_float_method {
                         // a value that overflows f32 but is finite in f64
                         // (e.g. `1e40` into `f32`).
                         Ok(value) if value.is_finite() => visitor.$visit(value),
-                        Ok(_) => Err(DeError::custom(alloc::format!(
-                            "number `{raw}` is not a finite float and cannot be represented"
-                        ))),
+                        Ok(_) => Err(DeError::custom(non_finite(&text))),
                         Err(_) => Err(DeError::custom(alloc::format!(
                             "number `{raw}` does not fit `{}`",
                             core::stringify!($ty)
@@ -281,6 +280,8 @@ impl<'de> Deserializer<'de> for Value {
     parse_int_method!(deserialize_u16, visit_u16, u16);
     parse_int_method!(deserialize_u32, visit_u32, u32);
     parse_int_method!(deserialize_u64, visit_u64, u64);
+    parse_int_method!(deserialize_i128, visit_i128, i128);
+    parse_int_method!(deserialize_u128, visit_u128, u128);
     parse_float_method!(deserialize_f32, visit_f32, f32);
     parse_float_method!(deserialize_f64, visit_f64, f64);
 
@@ -475,23 +476,21 @@ fn type_error(expected: &str, found: Value) -> DeError {
 /// Reads one number for `deserialize_any`: exact `i64`/`u64` text first
 /// (the [`Serialize`] mapping), then a finite `f64`; anything else is an
 /// error, never a silent retype.
-fn visit_number<'de, V>(text: Number, visitor: V) -> Result<V::Value, DeError>
+fn visit_number<'de, V>(number: Number, visitor: V) -> Result<V::Value, DeError>
 where
     V: Visitor<'de>,
 {
-    let raw = text.as_str();
-    if let Ok(value) = raw.parse::<i64>() {
-        return visitor.visit_i64(value);
+    match number.classify() {
+        Some(Classified::I64(value)) => visitor.visit_i64(value),
+        Some(Classified::U64(value)) => visitor.visit_u64(value),
+        Some(Classified::F64(value)) => visitor.visit_f64(value),
+        None => Err(DeError::custom(non_finite(&number))),
     }
-    if let Ok(value) = raw.parse::<u64>() {
-        return visitor.visit_u64(value);
-    }
-    match raw.parse::<f64>() {
-        Ok(value) if value.is_finite() => visitor.visit_f64(value),
-        _ => Err(DeError::custom(alloc::format!(
-            "number `{raw}` is not a finite float and cannot be represented"
-        ))),
-    }
+}
+
+/// The error text for a number no serde numeric type can hold.
+fn non_finite(number: &Number) -> alloc::string::String {
+    alloc::format!("number `{number}` is not a finite float and cannot be represented")
 }
 
 struct SeqDeserializer(alloc::vec::IntoIter<Value>);
@@ -754,5 +753,62 @@ mod from_value_tests {
         assert!(from_value::<i64>(value).is_err());
         let value = crate::parse("-1").expect("parses");
         assert!(from_value::<u64>(value).is_err());
+    }
+
+    /// Regression: a float from any serde source must become a `Value` that
+    /// renders as valid JSON. Non-finite floats used to become the number
+    /// text `NaN`/`inf` (invalid JSON); they are `null` now, as in
+    /// serde_json. Finite floats keep their shortest round-trip text, so a
+    /// `Value` → `Value` round trip keeps `1.0` a float.
+    #[test]
+    fn deserializing_floats_into_a_value_always_renders_valid_json() {
+        use serde::de::IntoDeserializer;
+        use serde::de::value::F64Deserializer;
+        for (float, want) in [
+            (f64::NAN, "null"),
+            (f64::INFINITY, "null"),
+            (f64::NEG_INFINITY, "null"),
+            (1.0, "1.0"),
+            (1e300, "1e300"),
+            (-2.5e-7, "-2.5e-7"),
+        ] {
+            let source: F64Deserializer<DeError> = float.into_deserializer();
+            let value = <Value as serde::Deserialize>::deserialize(source).expect("any float");
+            let text = value.to_json_string();
+            assert_eq!(text, want, "float {float:?}");
+            assert!(crate::validate(&text).is_ok(), "{text} must be valid JSON");
+        }
+        let value = crate::parse("[1.0, 2.5]").expect("parses");
+        let again: Value = from_value(value.clone()).expect("value to value");
+        assert_eq!(again, value);
+    }
+
+    /// 128-bit integer targets read the number text exactly, like the 64-bit
+    /// ones: identifiers beyond `u64` survive without a detour through `f64`.
+    #[test]
+    fn from_value_reads_128_bit_integers_exactly() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Ids {
+            big: u128,
+            small: i128,
+        }
+        let value = crate::parse(
+            "{big: 340282366920938463463374607431768211455, \
+             small: -170141183460469231731687303715884105728}",
+        )
+        .expect("repairs");
+        let ids: Ids = from_value(value).expect("deserializes");
+        assert_eq!(
+            ids,
+            Ids {
+                big: u128::MAX,
+                small: i128::MIN
+            }
+        );
+        // Too wide, or not an integer: an error, never a silent narrowing.
+        let value = crate::parse("340282366920938463463374607431768211456").expect("repairs");
+        assert!(from_value::<u128>(value).is_err());
+        let value = crate::parse("1.5").expect("repairs");
+        assert!(from_value::<i128>(value).is_err());
     }
 }

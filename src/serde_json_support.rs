@@ -101,8 +101,7 @@ pub fn loads(input: &str) -> Result<JsonValue, DeserializeError> {
 /// Returns [`DeserializeError`] when `input` cannot be repaired under `opts`;
 /// rendering itself does not fail.
 pub fn loads_with(input: &str, opts: Options) -> Result<JsonValue, DeserializeError> {
-    let value = crate::parse_with(input, opts)?;
-    Ok(value.to_serde_json())
+    Ok(crate::parse_with(input, opts)?.into())
 }
 
 impl Value {
@@ -117,58 +116,78 @@ impl Value {
     /// unless serde_json's `preserve_order` feature is enabled, and
     /// duplicate keys collapse to the last occurrence (jsonfix itself keeps
     /// duplicates and resolves `get` first-wins).
+    ///
+    /// This clones every string; `JsonValue::from(value)` (the [`From`]
+    /// conversion) consumes the tree and moves them instead.
     pub fn to_serde_json(&self) -> JsonValue {
-        match self {
+        JsonValue::from(self.clone())
+    }
+
+    /// Builds a `jsonfix` value from a `serde_json::Value`.
+    ///
+    /// This clones every string; `Value::from(json)` (the [`From`]
+    /// conversion) consumes the tree and moves them instead.
+    pub fn from_serde_json(value: &JsonValue) -> Value {
+        Value::from(value.clone())
+    }
+}
+
+/// Consuming conversion: strings and keys move into the `serde_json` tree
+/// without being copied. Numbers follow [`Value::to_serde_json`]'s rules.
+///
+/// ```
+/// let value = jsonfix::parse("{name: 'Ada', big: 1e400}").unwrap();
+/// let json = serde_json::Value::from(value);
+/// assert_eq!(json["name"], "Ada");
+/// assert_eq!(json["big"], "1e400"); // out-of-range text survives as a string
+/// ```
+impl From<Value> for JsonValue {
+    fn from(value: Value) -> Self {
+        match value {
             Value::Null => JsonValue::Null,
-            Value::Bool(value) => JsonValue::Bool(*value),
-            Value::Number(number) => {
-                let text = number.as_str();
-                if let Ok(value) = text.parse::<i64>() {
-                    JsonValue::from(value)
-                } else if let Ok(value) = text.parse::<u64>() {
-                    JsonValue::from(value)
-                } else {
-                    match text
-                        .parse::<f64>()
-                        .ok()
-                        .and_then(serde_json::Number::from_f64)
-                    {
-                        Some(value) => JsonValue::Number(value),
-                        None => JsonValue::String(String::from(text)),
-                    }
-                }
-            }
-            Value::String(text) => JsonValue::String(text.clone()),
-            Value::Array(items) => {
-                JsonValue::Array(items.iter().map(Value::to_serde_json).collect())
-            }
+            Value::Bool(value) => JsonValue::Bool(value),
+            Value::Number(number) => number_to_json(number),
+            Value::String(text) => JsonValue::String(text),
+            Value::Array(items) => JsonValue::Array(items.into_iter().map(Into::into).collect()),
             Value::Object(members) => JsonValue::Object(
                 members
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.to_serde_json()))
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into()))
                     .collect(),
             ),
         }
     }
+}
 
-    /// Builds a `jsonfix` value from a `serde_json::Value`.
-    pub fn from_serde_json(value: &JsonValue) -> Value {
+/// Consuming conversion from a `serde_json` tree; strings and keys move.
+impl From<JsonValue> for Value {
+    fn from(value: JsonValue) -> Self {
         match value {
             JsonValue::Null => Value::Null,
-            JsonValue::Bool(value) => Value::Bool(*value),
+            JsonValue::Bool(value) => Value::Bool(value),
             JsonValue::Number(number) => {
                 Value::Number(crate::value::Number::from_normalized(number.to_string()))
             }
-            JsonValue::String(text) => Value::String(text.clone()),
-            JsonValue::Array(items) => {
-                Value::Array(items.iter().map(Value::from_serde_json).collect())
-            }
+            JsonValue::String(text) => Value::String(text),
+            JsonValue::Array(items) => Value::Array(items.into_iter().map(Into::into).collect()),
             JsonValue::Object(members) => Value::Object(
                 members
-                    .iter()
-                    .map(|(key, value)| (key.clone(), Value::from_serde_json(value)))
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into()))
                     .collect(),
             ),
         }
+    }
+}
+
+/// An exact `i64`/`u64`, else a finite `f64`, else the number text as a
+/// string (never a silent `null`).
+fn number_to_json(number: crate::value::Number) -> JsonValue {
+    use crate::value::Classified;
+    match number.classify() {
+        Some(Classified::I64(value)) => JsonValue::from(value),
+        Some(Classified::U64(value)) => JsonValue::from(value),
+        Some(Classified::F64(value)) => JsonValue::from(value),
+        None => JsonValue::String(number.into_string()),
     }
 }

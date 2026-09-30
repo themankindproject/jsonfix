@@ -91,3 +91,41 @@ fn take_moves_a_subtree_out() {
     assert_eq!(payload["x"], 1);
     assert!(value["payload"].is_null());
 }
+
+#[test]
+fn builds_values_from_floats_options_and_pairs() {
+    // Floats keep the shortest round-trip text and always validate; values
+    // with no JSON spelling become `null` (serde_json's convention).
+    for (float, text) in [
+        (1.5_f64, "1.5"),
+        (0.1, "0.1"),
+        (1.0, "1.0"),
+        (-0.0, "-0.0"),
+        (1e300, "1e300"),
+        (1.25e-7, "1.25e-7"),
+        (f64::MAX, "1.7976931348623157e308"),
+    ] {
+        let value = Value::from(float);
+        assert_eq!(value.to_json_string(), text);
+        assert_eq!(value, float, "compares equal to its source");
+        assert!(jsonfix::validate(text).is_ok(), "{text} is valid JSON");
+    }
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(Value::from(bad).is_null());
+    }
+    assert_eq!(Value::from(0.5_f32), 0.5_f32);
+    assert!(Value::from(f32::NAN).is_null());
+
+    assert_eq!(Value::from(Some(3)), 3);
+    assert!(Value::from(None::<&str>).is_null());
+
+    let object: Value = [("a", Value::from(1)), ("a", Value::from("dup"))]
+        .into_iter()
+        .collect();
+    assert_eq!(object.to_json_string(), r#"{"a": 1, "a": "dup"}"#);
+    let from_strings: Value = vec![(String::from("k"), true)].into_iter().collect();
+    assert_eq!(from_strings["k"], true);
+    // Arrays still collect from plain values.
+    let array: Value = ["x", "y"].into_iter().collect();
+    assert_eq!(array.to_json_string(), r#"["x", "y"]"#);
+}

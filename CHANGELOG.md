@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `StreamRepairer` could resume a checkpoint recorded *before* the
+  double-escape verdict flipped on: the unescaped render records no
+  checkpoints, so when a later raw `"` flipped the verdict back off, the stale
+  checkpoint spliced a raw tail onto the unescaped prefix (`[\n1, ` +
+  `\"a\", ` + `"b"]` rendered `[1, "a", "a\"", "b"]` instead of
+  `repair`'s `["\\n1", "a\"", "b"]`). Every full render now starts from a
+  cleared checkpoint.
+- Deserializing a non-finite float into a `Value` (from any serde source)
+  produced the number text `NaN`/`inf`, which renders as invalid JSON. It now
+  becomes `null`, as in `serde_json`.
+
+### Changed
+
+- Floats deserialized into a `Value` keep their shortest round-trip *float*
+  spelling (`1.0`, `1e300`) instead of the integer-looking `Display` text
+  (`1`, `1000…0`), so `from_value::<Value>` is an exact round trip and a
+  float never re-serializes as an integer.
+
+### Added
+
+- Consuming conversions `From<Value> for serde_json::Value` and
+  `From<serde_json::Value> for Value` (feature `serde_json`): strings and keys
+  move instead of being cloned. `loads` uses them.
+- `From<f64>` / `From<f32>` (non-finite → `null`) and `From<Option<T>>`
+  (`None` → `null`) for `Value`; `FromIterator<(K, V)>` collects key/value
+  pairs into an object (arrays still collect from plain values).
+- `Number::into_string`.
+- 128-bit integers (feature `serde`): `from_value` reads `i128`/`u128` targets
+  from the number text exactly, and `Value` deserializes from `i128`/`u128`
+  sources.
+
+### Performance
+
+Criterion medians against a baseline recorded on 0.1.0, same machine
+(`cargo bench -p jsonfix-benchmarks`); ratios are the claim, absolute times
+move with the machine.
+
+| Benchmark | 0.1.0 | Unreleased | Time |
+|---|---|---|---|
+| `repair/fenced_body` (13 KB LLM reply) | 263.5 μs | 193.8 μs | −26% |
+| `repair/repair_extract` | 268.8 μs | 210.5 μs | −22% |
+| `partial/parse_full` | 224.5 μs | 180.7 μs | −20% |
+| `partial/parse_partial` | 222.8 μs | 180.4 μs | −19% |
+| `bytes/repair` | 265.0 μs | 194.7 μs | −26% |
+| `from_value/parse_then_from_value` | 482.1 μs | 408.4 μs | −15% |
+| `stream/token_chunks_8b/flat_object_800` | 4.20 ms | 3.10 ms | −26% |
+| `stream/chunks_64b/flat_object_200` | 400.3 μs | 308.4 μs | −24% |
+| `stream/ndjson_lines/200_lines` | 349.3 μs | 147.1 μs | −58% |
+| `stream/one_char_at_a_time/small_doc` | 18.9 μs | 15.3 μs | −20% |
+
+`extract/fenced` and `from_value/from_value_only` are unchanged (within ±2%).
+
+- **`StreamRepairer::push_delta` is linear.** It used to copy and
+  byte-compare the whole output on every chunk; it now diffs only the bytes
+  after the resumed checkpoint, a word at a time. A 51 KB object pushed in
+  8-byte chunks drops from 134 ms to 3.4 ms (≈ `push`'s 3.2 ms), and the new
+  `stream/token_chunks_8b/flat_object_800_delta` bench guards it.
+- **NDJSON streaming is linear.** Resuming no longer allocates a placeholder
+  per completed top-level value: 2000 lines pushed line by line drop from
+  25.9 ms to 1.5 ms.
+- **`extract_all` is linear.** Its bracket search is cached across values, so
+  prose full of bare scalars no longer rescans to the end per value (16 000
+  values: 4.3 s → 1.9 ms).
+- `loads` is 27–35% faster: it converts the tree by value instead of cloning
+  every string.
+- Lexer: an ASCII fast path in character peeking, a punctuator table, a
+  tighter trivia pre-check, `find`-based comment skipping, and a string fast
+  path that returns clean, well-terminated strings without entering the
+  repair loop.
+- Parser: each lookahead token is moved into place once (no dead drop of the
+  previous one), unquoted and keyword object keys borrow instead of
+  allocating, and checkpoint bookkeeping exits early on the one-shot `repair`
+  path.
+- SWAR scans (string content, `write_escaped`, `extract` string bodies)
+  combine all stop classes into one mask per 8-byte word — one branch instead
+  of three or four.
+- `extract` matches brackets byte-wise, skips string bodies in 8-byte strides,
+  and picks the preferred fence in a single pass without a candidate list.
+
+### Internal
+
+- Object and array loops share their separator/closer handling
+  (`separator_step`, `close_container`); tree mode keeps parsed values on one
+  stack instead of threading `Option<Value>` through every call.
+- Implemented once instead of two or three times: the double-escape
+  pre-pass, RFC 6901 token parsing (`pointer` / `pointer_mut`), comment and
+  fence skipping, the one-character escape table, number classification for
+  `Serialize` / `deserialize_any` / `serde_json`, and the stream
+  `push` / `push_delta` render path.
+- Non-test code in `src/` shrinks from 4052 to 3943 lines despite the
+  additions above; the duplicated fuzz-replay loops in the stream tests
+  collapse into one helper.
+- New regression tests cover every fix above, `Delta::keep` maximality,
+  `extract_all` scaling, the consuming `serde_json` conversions, and the
+  combined SWAR masks against a scalar reference. Verified against 0.1.0 by
+  replaying the full fuzz corpus (155 840 inputs) through every public API
+  with zero output differences.
+
 ## [0.1.0] - 2026-09-29
 
 First public release: everything below is new in `0.1.0`.

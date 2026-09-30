@@ -132,6 +132,22 @@ fn bench_stream_token_chunks(c: &mut Criterion) {
             t.elapsed()
         });
     });
+    // Same stream through `push_delta` (what a chat UI calls): the diff must
+    // cost the appended tail, not the whole output — an O(N) copy+compare per
+    // chunk made this ~40x slower than `push` on this document.
+    group.bench_function("flat_object_800_delta", |b| {
+        b.iter_custom(|iters| {
+            let t = Instant::now();
+            for _ in 0..iters {
+                let mut stream = StreamRepairer::new();
+                for part in &parts {
+                    black_box(stream.push_delta(black_box(part)).expect("repairs"));
+                }
+                black_box(stream.output());
+            }
+            t.elapsed()
+        });
+    });
     group.finish();
 }
 

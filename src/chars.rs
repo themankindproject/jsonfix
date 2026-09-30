@@ -100,6 +100,20 @@ pub(crate) fn hex_value(c: char) -> Option<u32> {
     c.to_digit(16)
 }
 
+/// The character a one-character escape `\c` stands for: JSON's own escapes
+/// plus JavaScript's `\'`. `None` for `u`/`x` and anything unknown.
+pub(crate) fn simple_escape(c: char) -> Option<char> {
+    Some(match c {
+        '"' | '\\' | '/' | '\'' => c,
+        'b' => '\u{08}',
+        'f' => '\u{0C}',
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        _ => return None,
+    })
+}
+
 /// Decodes a named or numeric HTML entity at the start of `fragment`.
 ///
 /// Returns the decoded character and the number of bytes consumed, or `None`
